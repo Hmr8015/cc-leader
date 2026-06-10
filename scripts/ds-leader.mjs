@@ -20,6 +20,7 @@ const dsRoot = path.join(root, ".cc-leader", "ds-leader");
 const latestDir = path.join(dsRoot, "latest");
 const logsDir = path.join(latestDir, "logs");
 const codexDir = path.join(latestDir, "codex");
+const debugDir = path.join(latestDir, "debug");
 const latestPaths = {
   spec: path.join(latestDir, "spec.md"),
   plan: path.join(latestDir, "plan.md"),
@@ -28,6 +29,7 @@ const latestPaths = {
   workerPrompt: path.join(latestDir, "worker.prompt.md"),
   review: path.join(latestDir, "review.md"),
   report: path.join(latestDir, "report.md"),
+  fixPrompt: path.join(latestDir, "fix.prompt.md"),
   state: path.join(latestDir, "state.json"),
   driveSummary: path.join(codexDir, "drive-summary.json"),
   driveStdout: path.join(codexDir, "stdout.jsonl"),
@@ -36,7 +38,7 @@ const latestPaths = {
 
 const legacyLatestJson = path.join(dsRoot, "latest.json");
 const legacyLatestPrompt = path.join(dsRoot, "latest.prompt.md");
-const commandNames = new Set(["spec", "plan", "task", "run", "review", "report"]);
+const commandNames = new Set(["spec", "plan", "task", "run", "review", "report", "fix"]);
 
 const help = rawArgs.includes("-h") || rawArgs.includes("--help");
 const previewOnly =
@@ -94,6 +96,9 @@ Phase 1 workflow 命令：
   ds-l review
     读取 latest 产物、Codex Worker 输出、git status/diff/cached diff/untracked text files，调 DeepSeek 判断执行是否通过。
 
+  ds-l fix
+    manual-only：仅当 latest review verdict 为 needs_fix 时，生成 fix.prompt.md 并调用 cc-leader drive 手动修复；不会自动 review/report 或循环。
+
   ds-l report
     读取 latest 产物、review、Codex Worker 输出、git status/diff/cached diff/untracked text files，调 DeepSeek 生成最终报告。
 
@@ -132,6 +137,7 @@ function ensureLatestDirs() {
   ensureDir(latestDir);
   ensureDir(logsDir);
   ensureDir(codexDir);
+  ensureDir(debugDir);
 }
 
 function repoRel(filePath) {
@@ -167,6 +173,11 @@ function writeText(filePath, content) {
   writeFileSync(filePath, `${String(content).replace(/\s+$/, "")}\n`, "utf8");
 }
 
+function writeRawText(filePath, content) {
+  ensureDir(path.dirname(filePath));
+  writeFileSync(filePath, String(content ?? ""), "utf8");
+}
+
 function readJsonIfExists(filePath) {
   if (!existsSync(filePath)) return null;
   return JSON.parse(readText(filePath));
@@ -187,6 +198,7 @@ function artifactPaths() {
     worker_prompt: repoRel(latestPaths.workerPrompt),
     review: repoRel(latestPaths.review),
     report: repoRel(latestPaths.report),
+    fix_prompt: repoRel(latestPaths.fixPrompt),
     state: repoRel(latestPaths.state),
   };
 }
@@ -243,6 +255,50 @@ function saveState(state, patch = {}) {
   return next;
 }
 
+function safeDebugName(command) {
+  return String(command || "deepseek")
+    .replace(/[^a-z0-9._-]+/gi, "_")
+    .replace(/^_+|_+$/g, "")
+    .toLowerCase() || "deepseek";
+}
+
+function rawResponsePath(command) {
+  return path.join(debugDir, `${safeDebugName(command)}.raw.txt`);
+}
+
+function latestErrorObject(command, message, rawResponseFile) {
+  return {
+    command,
+    message,
+    raw_response_file: repoRel(rawResponseFile),
+    created_at: nowIso(),
+  };
+}
+
+function recordLatestError({ command, message, rawResponseFile, stateFactory }) {
+  const latestError = latestErrorObject(command, message, rawResponseFile);
+  const existingState = readState();
+  const state = existingState || (typeof stateFactory === "function" ? stateFactory() : null);
+  if (!state) return latestError;
+  saveState(state, {
+    status: "blocked",
+    latest_error: latestError,
+    next_recommended_command: command ? `ds-l ${command}` : state.next_recommended_command,
+  });
+  return latestError;
+}
+
+function formatLatestError(latestError) {
+  if (!latestError) return null;
+  if (typeof latestError === "string") return latestError;
+  if (typeof latestError !== "object") return String(latestError);
+
+  const command = latestError.command ? `${latestError.command}: ` : "";
+  const message = latestError.message || JSON.stringify(latestError);
+  const rawFile = latestError.raw_response_file ? ` (${latestError.raw_response_file})` : "";
+  return `${command}${message}${rawFile}`;
+}
+
 function suggestNext(state) {
   if (!state) return 'ds-l spec "需求"';
   if (state.next_recommended_command) return state.next_recommended_command;
@@ -253,9 +309,10 @@ function suggestNext(state) {
   if (state.phase === "run") return "ds-l review";
   if (state.phase === "review") {
     if (state.review?.verdict === "pass") return "ds-l report";
-    if (state.review?.verdict === "needs_fix") return "Review found needs_fix; automatic fix is not implemented";
+    if (state.review?.verdict === "needs_fix") return "ds-l fix";
     if (state.review?.verdict === "needs_user_decision") return "Review needs user decision";
   }
+  if (state.phase === "fix") return "ds-l review";
   if (state.phase === "report") return state.next_recommended_command || "ds-l -s";
   return "ds-l -s";
 }
@@ -294,17 +351,162 @@ function deepSeekConfig() {
   };
 }
 
-function parseJsonLoose(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) throw new Error("DeepSeek did not return JSON.");
-    return JSON.parse(match[0]);
+function collectFencedBlocks(text) {
+  const blocks = [];
+  const fencePattern = /```([^\n`]*)\n?([\s\S]*?)```/g;
+  let match;
+
+  while ((match = fencePattern.exec(text)) !== null) {
+    const meta = match[1].trim();
+    let body = match[2];
+    let priority = 2;
+
+    if (/^json\b/i.test(meta)) {
+      priority = 0;
+      if (!body.trim()) body = meta.replace(/^json\b/i, "").trim();
+    } else if (!meta) {
+      priority = 1;
+    } else if (!body.trim() && meta.startsWith("{")) {
+      body = meta;
+    }
+
+    if (body.trim()) {
+      blocks.push({
+        body,
+        index: match.index,
+        priority,
+      });
+    }
   }
+
+  return blocks.sort((a, b) => a.priority - b.priority || a.index - b.index).map((block) => block.body);
 }
 
-async function callDeepSeekJson(stage, systemPrompt, userPrompt) {
+function collectCompleteJsonObjects(text) {
+  const candidates = [];
+  const source = String(text ?? "");
+
+  for (let start = source.indexOf("{"); start !== -1; start = source.indexOf("{", start + 1)) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let index = start; index < source.length; index += 1) {
+      const char = source[index];
+
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === "\\") {
+          escaped = true;
+        } else if (char === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (char === "\"") {
+        inString = true;
+      } else if (char === "{") {
+        depth += 1;
+      } else if (char === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          candidates.push(source.slice(start, index + 1));
+          break;
+        }
+      }
+    }
+  }
+
+  return candidates;
+}
+
+function jsonCandidates(text) {
+  const candidates = [];
+  const seen = new Set();
+  const add = (value) => {
+    const candidate = String(value ?? "").trim();
+    if (!candidate || seen.has(candidate)) return;
+    seen.add(candidate);
+    candidates.push(candidate);
+  };
+
+  add(text);
+  const fencedBlocks = collectFencedBlocks(String(text ?? ""));
+  for (const block of fencedBlocks) add(block);
+
+  const sources = [String(text ?? ""), ...fencedBlocks];
+  for (const source of sources) {
+    for (const objectText of collectCompleteJsonObjects(source)) {
+      add(objectText);
+    }
+  }
+
+  return candidates;
+}
+
+function deepSeekNonJsonMessage(command, rawResponseFile, rawContent, cause) {
+  const raw = String(rawContent ?? "");
+  const preview = raw ? raw.slice(0, 1000) : "(empty)";
+  const truncated = raw.length > 1000 ? "\n...(truncated; full raw response saved to file)" : "";
+  const parseError = cause?.message ? `\nParse error: ${cause.message}` : "";
+
+  return [
+    "DeepSeek returned non-JSON.",
+    `raw response saved to ${repoRel(rawResponseFile)}`,
+    "建议查看该文件以诊断模型输出。",
+    parseError.trimStart(),
+    "",
+    "Raw response preview (first 1000 chars):",
+    `${preview}${truncated}`,
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
+}
+
+function createDeepSeekNonJsonError({ command, rawContent, cause, rawResponseFile, stateFactory }) {
+  const filePath = rawResponseFile || rawResponsePath(command);
+  writeRawText(filePath, rawContent);
+  const latestError = recordLatestError({
+    command,
+    message: "DeepSeek returned non-JSON",
+    rawResponseFile: filePath,
+    stateFactory,
+  });
+  const error = new Error(deepSeekNonJsonMessage(command, filePath, rawContent, cause));
+  error.userFacing = true;
+  error.latestError = latestError;
+  error.cause = cause;
+  return error;
+}
+
+function parseJsonLoose(text, options = {}) {
+  let lastError = null;
+
+  for (const candidate of jsonCandidates(text)) {
+    try {
+      return JSON.parse(candidate);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  const cause = lastError || new Error("No complete JSON object found in response.");
+  if (options.command) {
+    throw createDeepSeekNonJsonError({
+      command: options.command,
+      rawContent: text,
+      cause,
+      rawResponseFile: options.rawResponseFile,
+      stateFactory: options.stateFactory,
+    });
+  }
+
+  throw new Error(`Could not parse JSON from response: ${cause.message}`);
+}
+
+async function callDeepSeekJson(stage, systemPrompt, userPrompt, options = {}) {
   const { apiKey, model } = deepSeekConfig();
   const body = {
     model,
@@ -326,17 +528,33 @@ async function callDeepSeekJson(stage, systemPrompt, userPrompt) {
     body: JSON.stringify(body),
   });
 
+  const responseText = await res.text();
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`DeepSeek API failed: HTTP ${res.status}\n${text}`);
+    throw new Error(`DeepSeek API failed: HTTP ${res.status}\n${responseText}`);
   }
 
-  const data = await res.json();
+  let data;
+  try {
+    data = JSON.parse(responseText);
+  } catch (error) {
+    throw createDeepSeekNonJsonError({
+      command: stage,
+      rawContent: responseText,
+      cause: error,
+      rawResponseFile: rawResponsePath(stage),
+      stateFactory: options.stateFactory,
+    });
+  }
+
   const content = data?.choices?.[0]?.message?.content;
   if (!content) {
     throw new Error(`No content in DeepSeek response:\n${JSON.stringify(data, null, 2)}`);
   }
-  const parsed = parseJsonLoose(content);
+  const parsed = parseJsonLoose(content, {
+    command: stage,
+    rawResponseFile: rawResponsePath(stage),
+    stateFactory: options.stateFactory,
+  });
   ensureLatestDirs();
   writeJson(path.join(logsDir, `deepseek-${stage}.json`), {
     stage,
@@ -402,6 +620,9 @@ ${request}
 2. acceptance_md 使用可观察的验收标准。
 3. 不启动 Codex，不写实现细节到需要 worker 猜测的程度。
 `,
+    {
+      stateFactory: () => baseState(request, "DS workflow"),
+    },
   );
 
   const title = requireString(parsed.title, "title");
@@ -879,6 +1100,45 @@ function workspaceReviewInputs() {
   };
 }
 
+function formatCurrentWorkspaceEvidence(workspaceInputs) {
+  return `## Current workspace evidence 当前工作区事实（authoritative）
+
+Highest-priority evidence rules:
+- Current workspace evidence is authoritative.
+- Current file contents override Worker last-message and drive logs.
+- Worker last-message is historical and may be stale.
+
+### git status --short
+
+${workspaceInputs.gitStatus}
+
+### git diff
+
+${workspaceInputs.gitDiff}
+
+### git diff --cached
+
+${workspaceInputs.gitDiffCached}
+
+### untracked text files contents and skipped untracked files list
+
+${workspaceInputs.untrackedFiles}`;
+}
+
+function formatHistoricalWorkerLogs({ workerLastMessage, workerStderr }) {
+  return `## Historical worker logs Worker 历史日志（may be stale）
+
+These logs are historical background only. They must not override Current workspace evidence.
+
+### state.drive.last_message_file
+
+${workerLastMessage}
+
+### state.drive.stderr_log
+
+${workerStderr || "(empty)"}`;
+}
+
 function commandRun() {
   const workerPrompt = loadLatestWorkerPrompt();
   ensureLatestDirs();
@@ -1009,6 +1269,18 @@ async function commandReview() {
 禁止要求自动 fix 循环，禁止生成 report。
 verdict 只能是 pass、needs_fix、needs_user_decision 三者之一。
 
+最高优先级规则：
+- Current workspace evidence is authoritative.
+- Current file contents override Worker last-message and drive logs.
+- Worker last-message is historical and may be stale.
+- If current file contents conflict with acceptance, verdict must be needs_fix, even if Worker logs claim success.
+
+硬性判定规则：
+- If a required output file is present in current workspace evidence and its current content violates acceptance, verdict must be needs_fix.
+- If current executable output is available and violates acceptance, verdict must be needs_fix.
+- Do not mark pass based only on Worker summary if current workspace evidence contradicts it.
+- If current workspace evidence includes untracked file contents, review those contents before historical Worker logs.
+
 输出 JSON schema:
 {
   "verdict": "pass | needs_fix | needs_user_decision",
@@ -1041,31 +1313,13 @@ acceptance.md:
 
 ${acceptance}
 
+${formatCurrentWorkspaceEvidence(workspaceInputs)}
+
 worker.prompt.md:
 
 ${workerPrompt}
 
-state.drive.last_message_file:
-
-${workerLastMessage}
-
-state.drive.stderr_log:
-
-${workerStderr || "(empty)"}
-
-git status --short:
-
-${workspaceInputs.gitStatus}
-
-git diff:
-
-${workspaceInputs.gitDiff}
-
-git diff --cached:
-
-${workspaceInputs.gitDiffCached}
-
-${workspaceInputs.untrackedFiles}
+${formatHistoricalWorkerLogs({ workerLastMessage, workerStderr })}
 
 请基于以上材料判断 Worker 是否满足 spec、plan、acceptance。
 要求：
@@ -1089,7 +1343,7 @@ ${workspaceInputs.untrackedFiles}
     verdict === "pass"
       ? "ds-l report"
       : verdict === "needs_fix"
-        ? "Review found needs_fix; automatic fix is not implemented"
+        ? "ds-l fix"
         : "Review needs user decision";
 
   writeText(latestPaths.review, reviewMd);
@@ -1128,9 +1382,198 @@ function requireReviewReady(state) {
   return requireVerdict(state.review.verdict);
 }
 
+function buildFixPrompt({
+  stateJson,
+  state,
+  spec,
+  plan,
+  task,
+  acceptance,
+  workerPrompt,
+  review,
+  report,
+  workerLastMessage,
+  workerStderr,
+  workspaceInputs,
+}) {
+  return `
+你是 Codex Worker。当前是 DS workflow 的手动 fix 阶段。
+
+【硬性边界】
+1. 只修复 review.md 中列出的 needs_fix 问题。
+2. 不要做无关重构。
+3. 不要扩大需求或新增未要求的功能。
+4. 不要删除无关文件。
+5. 不要自动调用 ds-l review。
+6. 不要自动调用 ds-l report。
+7. 不要实现 fix -> review -> fix 自动循环。
+8. 修复后运行必要验证；无法运行时说明原因。
+9. 最终输出修复摘要，包括修改文件、修复的问题、验证结果、剩余风险。
+10. 只根据当前 review.md 和 Current workspace evidence 当前工作区事实修复。
+11. Current workspace evidence is authoritative.
+12. Current file contents override Worker last-message and drive logs.
+13. Worker last-message is historical and may be stale.
+14. Historical worker logs 仅供背景，不得覆盖当前 review.md 或当前文件内容。
+
+【用户原始需求】
+${state.original_request || "(unknown)"}
+
+【state.json】
+${stateJson}
+
+【spec.md】
+${spec}
+
+【plan.md】
+${plan}
+
+【task.md】
+${task}
+
+【acceptance.md】
+${acceptance}
+
+【review.md】
+${review}
+
+${formatCurrentWorkspaceEvidence(workspaceInputs)}
+
+【worker.prompt.md】
+${workerPrompt}
+
+【report.md】
+${report || "(not present)"}
+
+${formatHistoricalWorkerLogs({ workerLastMessage, workerStderr })}
+
+请根据 review.md 中的 needs_fix 条目进行最小必要修复。完成后停止，输出修复摘要。
+`;
+}
+
+function commandFix() {
+  const state = readState();
+  if (!state) fail('没有 latest state。请先运行: ds-l spec "需求"');
+  const verdict = requireReviewReady(state);
+
+  if (verdict === "pass") {
+    fail("review.verdict = pass，无需修复。下一步建议: ds-l report");
+  }
+  if (verdict === "needs_user_decision") {
+    fail("review.verdict = needs_user_decision，需要先由用户决策；ds-l fix 不会自动修复这类问题。");
+  }
+  if (verdict !== "needs_fix") {
+    fail(`review.verdict = ${verdict}，ds-l fix 只允许在 needs_fix 时运行。`);
+  }
+
+  const currentFixIteration = Number.isInteger(state.review?.fix_iteration)
+    ? state.review.fix_iteration
+    : 0;
+  const maxFixIterations = Number.isInteger(state.limits?.max_fix_iterations)
+    ? state.limits.max_fix_iterations
+    : 2;
+  if (currentFixIteration >= maxFixIterations) {
+    fail(
+      `fix_iteration 已达到 limits.max_fix_iterations (${currentFixIteration}/${maxFixIterations})，请人工检查 review.md 后再决定下一步。`,
+    );
+  }
+
+  const stateJson = readRequiredText(latestPaths.state, "state.json", 'ds-l spec "需求"');
+  const spec = readRequiredText(latestPaths.spec, "spec.md", 'ds-l spec "需求"');
+  const plan = readRequiredText(latestPaths.plan, "plan.md", "ds-l plan");
+  const task = readRequiredText(latestPaths.task, "task.md", "ds-l task");
+  const acceptance = readRequiredText(latestPaths.acceptance, "acceptance.md", 'ds-l spec "需求"');
+  const workerPrompt = readRequiredText(latestPaths.workerPrompt, "worker.prompt.md", "ds-l task");
+  const review = readRequiredText(latestPaths.review, "review.md", "ds-l review");
+  const report = existsSync(latestPaths.report) ? readText(latestPaths.report).trim() : "";
+  const workerLastMessage = readRequiredStateFile(
+    state.drive?.last_message_file,
+    "state.drive.last_message_file",
+  );
+  const workerStderr = readRequiredStateFile(state.drive?.stderr_log, "state.drive.stderr_log");
+  const workspaceInputs = workspaceReviewInputs();
+  const fixPrompt = buildFixPrompt({
+    stateJson,
+    state,
+    spec,
+    plan,
+    task,
+    acceptance,
+    workerPrompt,
+    review,
+    report,
+    workerLastMessage,
+    workerStderr,
+    workspaceInputs,
+  });
+
+  ensureLatestDirs();
+  writeText(latestPaths.fixPrompt, fixPrompt);
+
+  console.log("\nStarting manual-only ds-l fix with generated fix prompt...\n");
+  const result = spawnSync("cc-leader", ["drive", fixPrompt], {
+    cwd: root,
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024 * 20,
+    env: process.env,
+  });
+
+  const stdout = result.stdout || "";
+  const stderr = result.stderr || "";
+  writeText(latestPaths.driveStdout, stdout);
+  writeText(latestPaths.driveStderr, stderr);
+  if (stdout) process.stdout.write(stdout);
+  if (stderr) process.stderr.write(stderr);
+
+  const summary = parseDriveSummary(stdout);
+  if (summary) {
+    writeJson(latestPaths.driveSummary, summary);
+  } else {
+    writeJson(latestPaths.driveSummary, {
+      raw_stdout: stdout,
+      raw_stderr: stderr,
+      exit_code: result.status ?? 1,
+      error: result.error?.message ?? null,
+    });
+  }
+
+  const latestState = readState();
+  if (latestState) {
+    const failed = Boolean(result.error) || (result.status ?? 1) !== 0;
+    saveState(latestState, {
+      phase: "fix",
+      status: failed ? "blocked" : "active",
+      latest_error: failed ? result.error?.message || `cc-leader drive exited ${result.status}` : null,
+      drive: {
+        ...latestState.drive,
+        drive_id: summary?.drive_id ?? latestState.drive?.drive_id ?? null,
+        thread_id: summary?.thread_id ?? latestState.drive?.thread_id ?? null,
+        status: summary?.status ?? null,
+        stop_reason: summary?.stop_reason ?? null,
+        summary_file: repoRel(latestPaths.driveSummary),
+        last_message_file: summary?.last_message_file ?? null,
+        stdout_log: summary?.stdout_log ?? repoRel(latestPaths.driveStdout),
+        stderr_log: summary?.stderr_log ?? repoRel(latestPaths.driveStderr),
+      },
+      review: {
+        ...latestState.review,
+        fix_iteration: currentFixIteration + 1,
+      },
+      next_recommended_command: "ds-l review",
+    });
+  }
+
+  console.log(`\nFix prompt: ${repoRel(latestPaths.fixPrompt)}`);
+  console.log("Next: ds-l review\n");
+
+  if (result.error) {
+    fail(result.error.message);
+  }
+  process.exit(result.status ?? 0);
+}
+
 function reportNextCommand(verdict) {
   if (verdict === "pass") return "Phase 3A report completed";
-  if (verdict === "needs_fix") return "manual fix not implemented; inspect review.md";
+  if (verdict === "needs_fix") return "ds-l fix";
   return "user decision required; inspect review.md";
 }
 
@@ -1158,6 +1601,13 @@ async function commandReport() {
 
 当前阶段：report。
 你必须生成最终报告，不要生成 fix 方案，不要自动调用 Codex，不要设计自动循环。
+报告证据规则：
+- Current workspace evidence is authoritative.
+- Current file contents override Worker last-message and drive logs.
+- Worker last-message is historical and may be stale.
+- If current file contents conflict with acceptance, report the final conclusion as needs_fix/blocked even if Worker logs claim success.
+- Do not write a completed/pass final conclusion based only on Worker summary if current workspace evidence contradicts it.
+- If current workspace evidence includes untracked file contents, review those contents before historical Worker logs.
 输出 JSON schema:
 {
   "report_md": "完整 Markdown report"
@@ -1187,35 +1637,17 @@ acceptance.md:
 
 ${acceptance}
 
-worker.prompt.md:
-
-${workerPrompt}
+${formatCurrentWorkspaceEvidence(workspaceInputs)}
 
 review.md:
 
 ${review}
 
-state.drive.last_message_file:
+worker.prompt.md:
 
-${workerLastMessage}
+${workerPrompt}
 
-state.drive.stderr_log:
-
-${workerStderr || "(empty)"}
-
-git status --short:
-
-${workspaceInputs.gitStatus}
-
-git diff:
-
-${workspaceInputs.gitDiff}
-
-git diff --cached:
-
-${workspaceInputs.gitDiffCached}
-
-${workspaceInputs.untrackedFiles}
+${formatHistoricalWorkerLogs({ workerLastMessage, workerStderr })}
 
 请生成 DS workflow v1 的最终报告 report.md。
 report.md 至少必须包含：
@@ -1234,7 +1666,7 @@ report.md 至少必须包含：
 要求：
 1. 基于 review verdict 给出最终结论。
 2. verdict=pass 时说明工作流已完成。
-3. verdict=needs_fix 时说明 manual fix 尚未实现，并引导查看 review.md。
+3. verdict=needs_fix 时说明可手动运行 ds-l fix，并引导查看 review.md。
 4. verdict=needs_user_decision 时说明需要用户决策，并引导查看 review.md。
 5. 禁止实现或要求自动 fix。
 6. 禁止自动调用 Codex 修复。
@@ -1301,7 +1733,8 @@ function showLatestStatus() {
   console.log(`phase: ${state.phase}`);
   console.log(`status: ${state.status}`);
   console.log(`updated_at: ${state.updated_at}`);
-  if (state.latest_error) console.log(`latest_error: ${state.latest_error}`);
+  const latestError = formatLatestError(state.latest_error);
+  if (latestError) console.log(`latest_error: ${latestError}`);
 
   console.log("\nArtifacts:");
   console.log(artifactLine("spec", latestPaths.spec));
@@ -1311,6 +1744,7 @@ function showLatestStatus() {
   console.log(artifactLine("worker_prompt", latestPaths.workerPrompt));
   console.log(artifactLine("review", latestPaths.review));
   console.log(artifactLine("report", latestPaths.report));
+  console.log(artifactLine("fix_prompt", latestPaths.fixPrompt));
   console.log(artifactLine("state", latestPaths.state));
 
   if (state.drive?.drive_id || existsSync(latestPaths.driveSummary)) {
@@ -1389,6 +1823,11 @@ async function main() {
     return;
   }
 
+  if (command === "fix") {
+    commandFix();
+    return;
+  }
+
   if (commandText) {
     await commandLegacyAuto(commandText);
     return;
@@ -1399,6 +1838,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(error.stack || error.message || error);
+  console.error(error?.userFacing ? error.message : error?.stack || error?.message || error);
   process.exit(1);
 });
