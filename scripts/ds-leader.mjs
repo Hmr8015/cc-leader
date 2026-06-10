@@ -22,6 +22,7 @@ const latestPaths = {
   task: path.join(latestDir, "task.md"),
   acceptance: path.join(latestDir, "acceptance.md"),
   workerPrompt: path.join(latestDir, "worker.prompt.md"),
+  review: path.join(latestDir, "review.md"),
   state: path.join(latestDir, "state.json"),
   driveSummary: path.join(codexDir, "drive-summary.json"),
   driveStdout: path.join(codexDir, "stdout.jsonl"),
@@ -30,7 +31,7 @@ const latestPaths = {
 
 const legacyLatestJson = path.join(dsRoot, "latest.json");
 const legacyLatestPrompt = path.join(dsRoot, "latest.prompt.md");
-const commandNames = new Set(["spec", "plan", "task", "run"]);
+const commandNames = new Set(["spec", "plan", "task", "run", "review"]);
 
 const help = rawArgs.includes("-h") || rawArgs.includes("--help");
 const previewOnly =
@@ -84,6 +85,9 @@ Phase 1 workflow 命令：
 
   ds-l run
     读取 latest/worker.prompt.md，调用 cc-leader drive 执行，不重新生成计划。
+
+  ds-l review
+    读取 latest 产物、Codex Worker 输出、git status/diff，调 DeepSeek 判断执行是否通过。
 
 兼容快捷方式：
 
@@ -173,6 +177,7 @@ function artifactPaths() {
     task: repoRel(latestPaths.task),
     acceptance: repoRel(latestPaths.acceptance),
     worker_prompt: repoRel(latestPaths.workerPrompt),
+    review: repoRel(latestPaths.review),
     state: repoRel(latestPaths.state),
   };
 }
@@ -236,7 +241,12 @@ function suggestNext(state) {
   if (state.phase === "plan") return "ds-l task";
   if (state.phase === "task") return "ds-l run";
   if (state.phase === "running") return "ds-l -s";
-  if (state.phase === "run") return "Phase 1 到 run 结束；review/report 尚未实现。";
+  if (state.phase === "run") return "ds-l review";
+  if (state.phase === "review") {
+    if (state.review?.verdict === "pass") return "Phase 2 review passed; report not implemented";
+    if (state.review?.verdict === "needs_fix") return "Review found needs_fix; automatic fix is not implemented";
+    if (state.review?.verdict === "needs_user_decision") return "Review needs user decision";
+  }
   return "ds-l -s";
 }
 
@@ -603,6 +613,27 @@ function parseDriveSummary(stdout) {
   }
 }
 
+function resolveRepoPath(filePath) {
+  if (!filePath) return null;
+  return path.isAbsolute(filePath) ? filePath : path.join(root, filePath);
+}
+
+function readRequiredStateFile(filePath, label) {
+  const resolved = resolveRepoPath(filePath);
+  if (!resolved || !existsSync(resolved)) {
+    fail(`${label} 不存在: ${filePath || "(missing)"}\n请先运行: ds-l run`);
+  }
+  return readText(resolved);
+}
+
+function commandOutput(cmd, label) {
+  const result = shell(cmd);
+  if (result.code !== 0) {
+    return `${label} failed with exit ${result.code}\n\nSTDOUT:\n${result.stdout}\n\nSTDERR:\n${result.stderr}`;
+  }
+  return result.stdout || "(empty)";
+}
+
 function commandRun() {
   const workerPrompt = loadLatestWorkerPrompt();
   ensureLatestDirs();
@@ -663,7 +694,7 @@ function commandRun() {
       },
       next_recommended_command: failed
         ? "ds-l -s"
-        : "Phase 1 到 run 结束；review/report 尚未实现。",
+        : "ds-l review",
     });
   }
 
@@ -671,6 +702,170 @@ function commandRun() {
     fail(result.error.message);
   }
   process.exit(result.status ?? 0);
+}
+
+function requireVerdict(value) {
+  const verdict = requireString(value, "verdict");
+  const allowed = new Set(["pass", "needs_fix", "needs_user_decision"]);
+  if (!allowed.has(verdict)) {
+    throw new Error(`DeepSeek JSON verdict 非法: ${verdict}`);
+  }
+  return verdict;
+}
+
+function normalizeNeeds(value) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) {
+    throw new Error("DeepSeek JSON 字段 needs 必须是数组。");
+  }
+  return value.map((item) => String(item).trim()).filter(Boolean);
+}
+
+function fallbackReviewMarkdown({ verdict, summary, needs }) {
+  const needsMd = needs.length ? needs.map((item) => `- ${item}`).join("\n") : "- None";
+  return `# DS Review
+
+## Verdict
+
+${verdict}
+
+## Summary
+
+${summary}
+
+## Needs
+
+${needsMd}
+`;
+}
+
+async function commandReview() {
+  const state = readState();
+  if (!state) fail('没有 latest state。请先运行: ds-l spec "需求"');
+
+  const spec = readRequiredText(latestPaths.spec, "spec.md", 'ds-l spec "需求"');
+  const plan = readRequiredText(latestPaths.plan, "plan.md", "ds-l plan");
+  const task = readRequiredText(latestPaths.task, "task.md", "ds-l task");
+  const acceptance = readRequiredText(latestPaths.acceptance, "acceptance.md", 'ds-l spec "需求"');
+  const workerPrompt = readRequiredText(latestPaths.workerPrompt, "worker.prompt.md", "ds-l task");
+  const workerLastMessage = readRequiredStateFile(
+    state.drive?.last_message_file,
+    "state.drive.last_message_file",
+  );
+  const workerStderr = readRequiredStateFile(state.drive?.stderr_log, "state.drive.stderr_log");
+  const gitStatus = commandOutput("git status --short", "git status --short");
+  const gitDiff = commandOutput("git diff", "git diff");
+
+  const parsed = await callDeepSeekJson(
+    "review",
+    `${baseSystemPrompt}
+
+当前阶段：review。
+你必须审查 Codex Worker 的执行是否符合 spec / plan / acceptance。
+禁止要求自动 fix 循环，禁止生成 report。
+verdict 只能是 pass、needs_fix、needs_user_decision 三者之一。
+
+输出 JSON schema:
+{
+  "verdict": "pass | needs_fix | needs_user_decision",
+  "summary": "简短审查总结",
+  "needs": ["needs_fix 时列出需要修复的问题；needs_user_decision 时列出需要用户确认的问题；pass 时可为空数组"],
+  "review_md": "完整 Markdown review，必须包含 Verdict、Summary、Evidence、Needs"
+}
+`,
+    `用户原始需求：
+
+${state.original_request || "(unknown)"}
+
+state.json:
+
+${JSON.stringify(state, null, 2)}
+
+spec.md:
+
+${spec}
+
+plan.md:
+
+${plan}
+
+task.md:
+
+${task}
+
+acceptance.md:
+
+${acceptance}
+
+worker.prompt.md:
+
+${workerPrompt}
+
+state.drive.last_message_file:
+
+${workerLastMessage}
+
+state.drive.stderr_log:
+
+${workerStderr || "(empty)"}
+
+git status --short:
+
+${gitStatus}
+
+git diff:
+
+${gitDiff}
+
+请基于以上材料判断 Worker 是否满足 spec、plan、acceptance。
+要求：
+1. 如果实现满足验收标准且没有明显阻塞，verdict=pass。
+2. 如果需要代码修复，verdict=needs_fix，并在 needs 中列出具体修复项。
+3. 如果不能安全判断或需要产品/用户取舍，verdict=needs_user_decision，并在 needs 中说明用户必须确认什么。
+4. 不要启动或建议自动修复循环。
+5. 不要生成 report。
+`,
+  );
+
+  const verdict = requireVerdict(parsed.verdict);
+  const summary = requireString(parsed.summary, "summary");
+  const parsedNeeds = normalizeNeeds(parsed.needs);
+  const needs = verdict === "pass" || parsedNeeds.length ? parsedNeeds : [summary];
+  const reviewMd =
+    typeof parsed.review_md === "string" && parsed.review_md.trim()
+      ? parsed.review_md.trim()
+      : fallbackReviewMarkdown({ verdict, summary, needs });
+  const nextRecommendedCommand =
+    verdict === "pass"
+      ? "Phase 2 review passed; report not implemented"
+      : verdict === "needs_fix"
+        ? "Review found needs_fix; automatic fix is not implemented"
+        : "Review needs user decision";
+
+  writeText(latestPaths.review, reviewMd);
+  saveState(state, {
+    phase: "review",
+    status: verdict === "pass" ? "active" : "blocked",
+    latest_error: null,
+    review: {
+      ...state.review,
+      verdict,
+      summary,
+      needs,
+    },
+    next_recommended_command: nextRecommendedCommand,
+  });
+
+  console.log("\n=== DS Review ===");
+  console.log(`Verdict: ${verdict}`);
+  console.log(`Summary: ${summary}`);
+  if (needs.length) {
+    console.log("Needs:");
+    for (const need of needs) console.log(`- ${need}`);
+  }
+  console.log(`Review: ${repoRel(latestPaths.review)}`);
+  console.log(`Next: ${nextRecommendedCommand}\n`);
+  return readState();
 }
 
 async function commandPreview(request) {
@@ -722,6 +917,7 @@ function showLatestStatus() {
   console.log(artifactLine("task", latestPaths.task));
   console.log(artifactLine("acceptance", latestPaths.acceptance));
   console.log(artifactLine("worker_prompt", latestPaths.workerPrompt));
+  console.log(artifactLine("review", latestPaths.review));
   console.log(artifactLine("state", latestPaths.state));
 
   if (state.drive?.drive_id || existsSync(latestPaths.driveSummary)) {
@@ -730,6 +926,15 @@ function showLatestStatus() {
     console.log(`- status: ${state.drive?.status ?? "(unknown)"}`);
     console.log(`- stop_reason: ${state.drive?.stop_reason ?? "(unknown)"}`);
     console.log(`- summary_file: ${state.drive?.summary_file ?? repoRel(latestPaths.driveSummary)}`);
+  }
+
+  if (state.review?.verdict || existsSync(latestPaths.review)) {
+    console.log("\nReview:");
+    console.log(`- verdict: ${state.review?.verdict ?? "(unknown)"}`);
+    console.log(`- summary: ${state.review?.summary ?? "(unknown)"}`);
+    if (state.review?.needs?.length) {
+      console.log(`- needs: ${state.review.needs.join("; ")}`);
+    }
   }
 
   console.log(`\nNext: ${suggestNext(state)}\n`);
@@ -773,6 +978,11 @@ async function main() {
 
   if (command === "run") {
     commandRun();
+    return;
+  }
+
+  if (command === "review") {
+    await commandReview();
     return;
   }
 
