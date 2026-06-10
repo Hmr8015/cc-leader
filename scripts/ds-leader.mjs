@@ -3,9 +3,13 @@
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
+  closeSync,
   existsSync,
+  lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
@@ -88,10 +92,10 @@ Phase 1 workflow 命令：
     读取 latest/worker.prompt.md，调用 cc-leader drive 执行，不重新生成计划。
 
   ds-l review
-    读取 latest 产物、Codex Worker 输出、git status/diff，调 DeepSeek 判断执行是否通过。
+    读取 latest 产物、Codex Worker 输出、git status/diff/cached diff/untracked text files，调 DeepSeek 判断执行是否通过。
 
   ds-l report
-    读取 latest 产物、review、Codex Worker 输出、git status/diff，调 DeepSeek 生成最终报告。
+    读取 latest 产物、review、Codex Worker 输出、git status/diff/cached diff/untracked text files，调 DeepSeek 生成最终报告。
 
 兼容快捷方式：
 
@@ -640,6 +644,241 @@ function commandOutput(cmd, label) {
   return result.stdout || "(empty)";
 }
 
+const maxUntrackedFileChars = 20000;
+const maxUntrackedTotalChars = 60000;
+const binaryExtensions = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".ico",
+  ".zip",
+  ".tar",
+  ".gz",
+  ".7z",
+  ".rar",
+  ".sqlite",
+  ".db",
+  ".mp4",
+  ".mov",
+  ".mp3",
+  ".wav",
+  ".pdf",
+  ".docx",
+  ".xlsx",
+  ".pptx",
+]);
+
+const languageByExtension = new Map([
+  [".css", "css"],
+  [".html", "html"],
+  [".js", "javascript"],
+  [".jsx", "jsx"],
+  [".json", "json"],
+  [".md", "markdown"],
+  [".mjs", "javascript"],
+  [".ts", "typescript"],
+  [".tsx", "tsx"],
+  [".yml", "yaml"],
+  [".yaml", "yaml"],
+]);
+
+function skippedUntrackedReason(filePath) {
+  const parts = filePath.split("/");
+  if (
+    parts.includes(".git") ||
+    parts.includes(".cc-leader") ||
+    parts.includes("node_modules") ||
+    parts.includes("dist") ||
+    parts.includes("build") ||
+    parts.includes("coverage") ||
+    parts.includes(".next") ||
+    parts.includes(".venv") ||
+    parts.some((part) => part.includes("pycache"))
+  ) {
+    return "skipped path";
+  }
+  const ext = path.extname(filePath).toLowerCase();
+  if (binaryExtensions.has(ext)) return "skipped binary extension";
+  return null;
+}
+
+function hasNulByte(buffer) {
+  for (const byte of buffer) {
+    if (byte === 0) return true;
+  }
+  return false;
+}
+
+function readFilePrefix(filePath, maxBytes) {
+  const fd = openSync(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(maxBytes);
+    const bytesRead = readSync(fd, buffer, 0, maxBytes, 0);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function readUntrackedTextPrefix(absPath, originalSize, charLimit) {
+  const maxBytes = Math.min(originalSize, Math.max(0, charLimit) * 4 + 1024);
+  const buffer = readFilePrefix(absPath, maxBytes);
+  const text = buffer.toString("utf8");
+  const content = text.slice(0, charLimit);
+  return {
+    content,
+    truncated: originalSize > Buffer.byteLength(content, "utf8") || text.length > content.length,
+    readChars: content.length,
+  };
+}
+
+function markdownFenceFor(content) {
+  const matches = content.match(/`{3,}/g) || [];
+  const longest = matches.reduce((max, item) => Math.max(max, item.length), 2);
+  return "`".repeat(longest + 1);
+}
+
+function untrackedLanguage(filePath) {
+  return languageByExtension.get(path.extname(filePath).toLowerCase()) || "";
+}
+
+function listUntrackedFiles() {
+  const result = spawnSync("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
+    cwd: root,
+    encoding: "buffer",
+    maxBuffer: 1024 * 1024 * 10,
+  });
+  if ((result.status ?? 1) !== 0) {
+    return {
+      files: [],
+      error: `git ls-files --others --exclude-standard -z failed with exit ${result.status ?? 1}\n\nSTDERR:\n${result.stderr.toString("utf8")}`,
+    };
+  }
+  return {
+    files: result.stdout
+      .toString("utf8")
+      .split("\0")
+      .filter((item) => item.length > 0),
+    error: null,
+  };
+}
+
+function collectUntrackedTextFiles() {
+  const listed = listUntrackedFiles();
+  const files = [];
+  const skipped = [];
+  let remainingChars = maxUntrackedTotalChars;
+
+  for (const filePath of listed.files) {
+    const pathReason = skippedUntrackedReason(filePath);
+    if (pathReason) {
+      skipped.push({ path: filePath, reason: pathReason });
+      continue;
+    }
+
+    const absPath = path.join(root, filePath);
+    let stat;
+    try {
+      stat = lstatSync(absPath);
+    } catch (error) {
+      skipped.push({ path: filePath, reason: `stat failed: ${error.message}` });
+      continue;
+    }
+    if (!stat.isFile()) {
+      skipped.push({ path: filePath, reason: "not a regular file" });
+      continue;
+    }
+
+    try {
+      const probe = readFilePrefix(absPath, Math.min(stat.size, 4096));
+      if (hasNulByte(probe)) {
+        skipped.push({ path: filePath, reason: "binary content detected" });
+        continue;
+      }
+    } catch (error) {
+      skipped.push({ path: filePath, reason: `read failed: ${error.message}` });
+      continue;
+    }
+
+    if (remainingChars <= 0) {
+      skipped.push({ path: filePath, reason: "total untracked content limit reached" });
+      continue;
+    }
+
+    try {
+      const charLimit = Math.min(maxUntrackedFileChars, remainingChars);
+      const read = readUntrackedTextPrefix(absPath, stat.size, charLimit);
+      files.push({
+        path: filePath,
+        originalSize: stat.size,
+        ...read,
+      });
+      remainingChars -= read.readChars;
+    } catch (error) {
+      skipped.push({ path: filePath, reason: `read failed: ${error.message}` });
+    }
+  }
+
+  return {
+    error: listed.error,
+    files,
+    skipped,
+    totalReadChars: maxUntrackedTotalChars - remainingChars,
+  };
+}
+
+function formatUntrackedTextFiles(untracked) {
+  const lines = ["## Untracked file contents", ""];
+  if (untracked.error) {
+    lines.push(untracked.error, "");
+  }
+  if (!untracked.files.length) {
+    lines.push("(none)", "");
+  }
+
+  for (const file of untracked.files) {
+    const fence = markdownFenceFor(file.content);
+    const language = untrackedLanguage(file.path);
+    lines.push(`### ${file.path}`, "");
+    if (file.truncated) {
+      lines.push(
+        `Truncated: yes. Original size: ${file.originalSize} bytes. Read: ${file.readChars} chars.`,
+        "",
+      );
+    } else {
+      lines.push(`Truncated: no. Original size: ${file.originalSize} bytes. Read: ${file.readChars} chars.`, "");
+    }
+    lines.push(`${fence}${language}`, file.content, fence, "");
+  }
+
+  lines.push("## Skipped untracked files", "");
+  if (!untracked.skipped.length) {
+    lines.push("(none)", "");
+  } else {
+    for (const item of untracked.skipped) {
+      lines.push(`- ${item.path}: ${item.reason}`);
+    }
+    lines.push("");
+  }
+  lines.push(`Total untracked text chars read: ${untracked.totalReadChars}/${maxUntrackedTotalChars}`);
+  return lines.join("\n");
+}
+
+function workspaceReviewInputs() {
+  const gitStatus = commandOutput("git status --short", "git status --short");
+  const gitDiff = commandOutput("git diff", "git diff");
+  const gitDiffCached = commandOutput("git diff --cached", "git diff --cached");
+  const untrackedFiles = formatUntrackedTextFiles(collectUntrackedTextFiles());
+  return {
+    gitStatus,
+    gitDiff,
+    gitDiffCached,
+    untrackedFiles,
+  };
+}
+
 function commandRun() {
   const workerPrompt = loadLatestWorkerPrompt();
   ensureLatestDirs();
@@ -759,8 +998,7 @@ async function commandReview() {
     "state.drive.last_message_file",
   );
   const workerStderr = readRequiredStateFile(state.drive?.stderr_log, "state.drive.stderr_log");
-  const gitStatus = commandOutput("git status --short", "git status --short");
-  const gitDiff = commandOutput("git diff", "git diff");
+  const workspaceInputs = workspaceReviewInputs();
 
   const parsed = await callDeepSeekJson(
     "review",
@@ -817,11 +1055,17 @@ ${workerStderr || "(empty)"}
 
 git status --short:
 
-${gitStatus}
+${workspaceInputs.gitStatus}
 
 git diff:
 
-${gitDiff}
+${workspaceInputs.gitDiff}
+
+git diff --cached:
+
+${workspaceInputs.gitDiffCached}
+
+${workspaceInputs.untrackedFiles}
 
 请基于以上材料判断 Worker 是否满足 spec、plan、acceptance。
 要求：
@@ -906,8 +1150,7 @@ async function commandReport() {
     "state.drive.last_message_file",
   );
   const workerStderr = readRequiredStateFile(state.drive?.stderr_log, "state.drive.stderr_log");
-  const gitStatus = commandOutput("git status --short", "git status --short");
-  const gitDiff = commandOutput("git diff", "git diff");
+  const workspaceInputs = workspaceReviewInputs();
 
   const parsed = await callDeepSeekJson(
     "report",
@@ -962,11 +1205,17 @@ ${workerStderr || "(empty)"}
 
 git status --short:
 
-${gitStatus}
+${workspaceInputs.gitStatus}
 
 git diff:
 
-${gitDiff}
+${workspaceInputs.gitDiff}
+
+git diff --cached:
+
+${workspaceInputs.gitDiffCached}
+
+${workspaceInputs.untrackedFiles}
 
 请生成 DS workflow v1 的最终报告 report.md。
 report.md 至少必须包含：
