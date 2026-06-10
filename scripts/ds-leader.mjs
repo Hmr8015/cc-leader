@@ -23,6 +23,7 @@ const latestPaths = {
   acceptance: path.join(latestDir, "acceptance.md"),
   workerPrompt: path.join(latestDir, "worker.prompt.md"),
   review: path.join(latestDir, "review.md"),
+  report: path.join(latestDir, "report.md"),
   state: path.join(latestDir, "state.json"),
   driveSummary: path.join(codexDir, "drive-summary.json"),
   driveStdout: path.join(codexDir, "stdout.jsonl"),
@@ -31,7 +32,7 @@ const latestPaths = {
 
 const legacyLatestJson = path.join(dsRoot, "latest.json");
 const legacyLatestPrompt = path.join(dsRoot, "latest.prompt.md");
-const commandNames = new Set(["spec", "plan", "task", "run", "review"]);
+const commandNames = new Set(["spec", "plan", "task", "run", "review", "report"]);
 
 const help = rawArgs.includes("-h") || rawArgs.includes("--help");
 const previewOnly =
@@ -88,6 +89,9 @@ Phase 1 workflow 命令：
 
   ds-l review
     读取 latest 产物、Codex Worker 输出、git status/diff，调 DeepSeek 判断执行是否通过。
+
+  ds-l report
+    读取 latest 产物、review、Codex Worker 输出、git status/diff，调 DeepSeek 生成最终报告。
 
 兼容快捷方式：
 
@@ -178,6 +182,7 @@ function artifactPaths() {
     acceptance: repoRel(latestPaths.acceptance),
     worker_prompt: repoRel(latestPaths.workerPrompt),
     review: repoRel(latestPaths.review),
+    report: repoRel(latestPaths.report),
     state: repoRel(latestPaths.state),
   };
 }
@@ -243,10 +248,11 @@ function suggestNext(state) {
   if (state.phase === "running") return "ds-l -s";
   if (state.phase === "run") return "ds-l review";
   if (state.phase === "review") {
-    if (state.review?.verdict === "pass") return "Phase 2 review passed; report not implemented";
+    if (state.review?.verdict === "pass") return "ds-l report";
     if (state.review?.verdict === "needs_fix") return "Review found needs_fix; automatic fix is not implemented";
     if (state.review?.verdict === "needs_user_decision") return "Review needs user decision";
   }
+  if (state.phase === "report") return state.next_recommended_command || "ds-l -s";
   return "ds-l -s";
 }
 
@@ -837,7 +843,7 @@ ${gitDiff}
       : fallbackReviewMarkdown({ verdict, summary, needs });
   const nextRecommendedCommand =
     verdict === "pass"
-      ? "Phase 2 review passed; report not implemented"
+      ? "ds-l report"
       : verdict === "needs_fix"
         ? "Review found needs_fix; automatic fix is not implemented"
         : "Review needs user decision";
@@ -864,6 +870,143 @@ ${gitDiff}
     for (const need of needs) console.log(`- ${need}`);
   }
   console.log(`Review: ${repoRel(latestPaths.review)}`);
+  console.log(`Next: ${nextRecommendedCommand}\n`);
+  return readState();
+}
+
+function requireReviewReady(state) {
+  if (!existsSync(latestPaths.review)) {
+    fail(`review.md 不存在: ${repoRel(latestPaths.review)}\n请先运行: ds-l review`);
+  }
+  if (!state.review?.verdict) {
+    fail("state.json 中 review.verdict 为空。\n请先运行: ds-l review");
+  }
+  return requireVerdict(state.review.verdict);
+}
+
+function reportNextCommand(verdict) {
+  if (verdict === "pass") return "Phase 3A report completed";
+  if (verdict === "needs_fix") return "manual fix not implemented; inspect review.md";
+  return "user decision required; inspect review.md";
+}
+
+async function commandReport() {
+  const state = readState();
+  if (!state) fail('没有 latest state。请先运行: ds-l spec "需求"');
+  const verdict = requireReviewReady(state);
+
+  const spec = readRequiredText(latestPaths.spec, "spec.md", 'ds-l spec "需求"');
+  const plan = readRequiredText(latestPaths.plan, "plan.md", "ds-l plan");
+  const task = readRequiredText(latestPaths.task, "task.md", "ds-l task");
+  const acceptance = readRequiredText(latestPaths.acceptance, "acceptance.md", 'ds-l spec "需求"');
+  const workerPrompt = readRequiredText(latestPaths.workerPrompt, "worker.prompt.md", "ds-l task");
+  const review = readRequiredText(latestPaths.review, "review.md", "ds-l review");
+  const workerLastMessage = readRequiredStateFile(
+    state.drive?.last_message_file,
+    "state.drive.last_message_file",
+  );
+  const workerStderr = readRequiredStateFile(state.drive?.stderr_log, "state.drive.stderr_log");
+  const gitStatus = commandOutput("git status --short", "git status --short");
+  const gitDiff = commandOutput("git diff", "git diff");
+
+  const parsed = await callDeepSeekJson(
+    "report",
+    `${baseSystemPrompt}
+
+当前阶段：report。
+你必须生成最终报告，不要生成 fix 方案，不要自动调用 Codex，不要设计自动循环。
+输出 JSON schema:
+{
+  "report_md": "完整 Markdown report"
+}
+`,
+    `用户原始需求：
+
+${state.original_request || "(unknown)"}
+
+state.json:
+
+${JSON.stringify(state, null, 2)}
+
+spec.md:
+
+${spec}
+
+plan.md:
+
+${plan}
+
+task.md:
+
+${task}
+
+acceptance.md:
+
+${acceptance}
+
+worker.prompt.md:
+
+${workerPrompt}
+
+review.md:
+
+${review}
+
+state.drive.last_message_file:
+
+${workerLastMessage}
+
+state.drive.stderr_log:
+
+${workerStderr || "(empty)"}
+
+git status --short:
+
+${gitStatus}
+
+git diff:
+
+${gitDiff}
+
+请生成 DS workflow v1 的最终报告 report.md。
+report.md 至少必须包含：
+1. 任务标题
+2. 原始需求
+3. workflow_id
+4. spec 摘要
+5. plan 摘要
+6. task 摘要
+7. Codex run 结果
+8. DS review verdict
+9. DS review summary
+10. git status 摘要
+11. 最终结论
+
+要求：
+1. 基于 review verdict 给出最终结论。
+2. verdict=pass 时说明工作流已完成。
+3. verdict=needs_fix 时说明 manual fix 尚未实现，并引导查看 review.md。
+4. verdict=needs_user_decision 时说明需要用户决策，并引导查看 review.md。
+5. 禁止实现或要求自动 fix。
+6. 禁止自动调用 Codex 修复。
+7. 禁止自动循环。
+`,
+  );
+
+  const reportMd = requireString(parsed.report_md, "report_md");
+  const nextRecommendedCommand = reportNextCommand(verdict);
+
+  writeText(latestPaths.report, reportMd);
+  saveState(state, {
+    phase: "report",
+    status: verdict === "pass" ? "completed" : "active",
+    latest_error: null,
+    next_recommended_command: nextRecommendedCommand,
+  });
+
+  console.log("\n=== DS Report ===");
+  console.log(`Verdict: ${verdict}`);
+  console.log(`Report: ${repoRel(latestPaths.report)}`);
   console.log(`Next: ${nextRecommendedCommand}\n`);
   return readState();
 }
@@ -918,6 +1061,7 @@ function showLatestStatus() {
   console.log(artifactLine("acceptance", latestPaths.acceptance));
   console.log(artifactLine("worker_prompt", latestPaths.workerPrompt));
   console.log(artifactLine("review", latestPaths.review));
+  console.log(artifactLine("report", latestPaths.report));
   console.log(artifactLine("state", latestPaths.state));
 
   if (state.drive?.drive_id || existsSync(latestPaths.driveSummary)) {
@@ -935,6 +1079,11 @@ function showLatestStatus() {
     if (state.review?.needs?.length) {
       console.log(`- needs: ${state.review.needs.join("; ")}`);
     }
+  }
+
+  if (existsSync(latestPaths.report)) {
+    console.log("\nReport:");
+    console.log(`- report: ${repoRel(latestPaths.report)}`);
   }
 
   console.log(`\nNext: ${suggestNext(state)}\n`);
@@ -983,6 +1132,11 @@ async function main() {
 
   if (command === "review") {
     await commandReview();
+    return;
+  }
+
+  if (command === "report") {
+    await commandReport();
     return;
   }
 
