@@ -1530,9 +1530,14 @@ function requireVerdict(value) {
 }
 
 async function commandReview({ explicit = true } = {}) {
-  const state = readState();
+  let state = readState();
   if (!state) fail('没有 latest state。请先运行: ds-l spec "需求"');
   requireCleanWorktree("ds-l review");
+  if (explicit && !state.review?.explicitly_requested) {
+    state = saveState(state, {
+      review: { ...state.review, explicitly_requested: true },
+    });
+  }
   const task = readRequiredText(latestPaths.task, "task.md", "ds-l task");
   const acceptance = readRequiredText(latestPaths.acceptance, "acceptance.md", 'ds-l spec "需求"');
   const head = currentHead();
@@ -2036,9 +2041,12 @@ function commandMerge() {
 
   const mainPath = mainWorktreePath();
   requireCleanWorktree("main worktree 合回", mainPath);
-  runGitStep(["merge", "--ff-only", "origin/main"], "main 更新到 origin/main", mainPath);
+  const mainHead = gitText(["rev-parse", "HEAD"], "读取 main HEAD", mainPath);
+  if ((runGit(["merge-base", "--is-ancestor", mainHead, head], mainPath).status ?? 1) !== 0) {
+    fail("本地 main 无法 ff-only 到审核 HEAD，请先处理 main 分支状态。");
+  }
+  runGitStep(["push", "origin", `${head}:refs/heads/main`], "push audited HEAD to origin/main", mainPath);
   runGitStep(["merge", "--ff-only", head], `main ff-only merge audited HEAD ${head}`, mainPath);
-  runGitStep(["push", "origin", "main"], "git push origin main", mainPath);
   saveState(state, {
     phase: "merged",
     status: "completed",
