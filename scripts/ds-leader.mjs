@@ -404,6 +404,15 @@ function requireCleanWorktree(stage, cwd = root) {
   if (status) fail(`${stage} 要求干净 worktree，请先提交或处理以下改动：\n${status}`);
 }
 
+function requireTaskWorktree(stage) {
+  const branch = currentBranch();
+  if (!branch || branch === "main") fail(`${stage} 必须在任务 worktree 分支运行，不能直接在 main 上运行。`);
+  const taskPath = gitText(["rev-parse", "--show-toplevel"], "读取任务 worktree 路径");
+  if (path.resolve(taskPath) === path.resolve(mainWorktreePath())) {
+    fail(`${stage} 必须在独立任务 worktree 运行。`);
+  }
+}
+
 function requireCommitRange(base, head) {
   if (!base) fail("缺少 review_base_sha；请重新运行 ds-l run。 ");
   const result = runGit(["merge-base", "--is-ancestor", base, head]);
@@ -934,11 +943,11 @@ function driveIncomplete(summary) {
 }
 
 function requestIsBugfix(request) {
-  return /\bbug\b|修复|修正|缺陷|故障|错误|异常|崩溃|回归/i.test(request || "");
+  return /\b(?:bug|fix|repair|hotfix)\b|修复|修正|缺陷|故障|错误|异常|崩溃|回归|失败|失效|报错|问题/i.test(request || "");
 }
 
 function requestRequiresReview(request) {
-  return /审核|审查|审阅|复审|\breview\b|\baudit\b/i.test(request || "");
+  return /审核|审查|审阅|复审|检查|走查|检视|评审|复核|\b(?:review|audit|inspect|inspection|check|walkthrough)\b/i.test(request || "");
 }
 
 function runDriveToCompletion(prompt) {
@@ -1265,8 +1274,7 @@ function commandRun() {
   const state = readState();
   if (!state) fail('没有 latest state。请先运行: ds-l spec "需求"');
   requireCleanWorktree("ds-l run");
-  const branch = currentBranch();
-  if (!branch || branch === "main") fail("ds-l run 必须在任务 worktree 分支运行，不能直接在 main 上运行。");
+  requireTaskWorktree("ds-l run");
   const currentSha = currentHead();
   const startSha = state.git?.start_sha || currentSha;
   const reviewBaseSha = state.git?.review_base_sha || startSha;
@@ -1737,8 +1745,7 @@ function commandFix() {
     fail(`review.verdict = ${verdict}，ds-l fix 只允许在 needs_fix 时运行。`);
   }
   requireCleanWorktree("ds-l fix");
-  const branch = currentBranch();
-  if (!branch || branch === "main") fail("ds-l fix 必须在任务 worktree 分支运行，不能直接在 main 上运行。");
+  requireTaskWorktree("ds-l fix");
   const beforeHead = currentHead();
 
   const currentFixIteration = Number.isInteger(state.review?.fix_iteration)
@@ -1885,9 +1892,7 @@ function reviewInvalidation(state, upstream, head, finalReview = false) {
 
 function prepareReviewBase(state) {
   requireCleanWorktree("ds-l close");
-  const branch = currentBranch();
-  if (!branch) fail("ds-l close 不支持 detached HEAD。");
-  if (branch === "main") fail("ds-l close 必须在任务 worktree 分支运行，不能直接在 main 上运行。");
+  requireTaskWorktree("ds-l close");
 
   runGitStep(["fetch", "origin"], "git fetch origin");
   const upstream = gitText(["rev-parse", "origin/main"], "读取 origin/main");
@@ -2309,8 +2314,11 @@ function runSelfTest() {
   assert.equal(rejectedAllFindings({ latest_message: noChangeAdjudication }), true);
   assert.equal(rejectedAllFindings({ latest_message: "fixed" }), false);
   assert.equal(requestIsBugfix("修复登录错误"), true);
+  assert.equal(requestIsBugfix("fix login"), true);
+  assert.equal(requestIsBugfix("登录失败"), true);
   assert.equal(requestIsBugfix("新增登录页"), false);
   assert.equal(requestRequiresReview("请审查这个改动"), true);
+  assert.equal(requestRequiresReview("please check this change"), true);
   assert.equal(requestRequiresReview("新增登录页"), false);
   assert.deepEqual(summarizeChangeStats("a.js\0", "5\t5\ta.js"), {
     files: ["a.js"],
