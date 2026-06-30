@@ -1698,6 +1698,8 @@ function commandFix() {
     fail(`review.verdict = ${verdict}，ds-l fix 只允许在 needs_fix 时运行。`);
   }
   requireCleanWorktree("ds-l fix");
+  const branch = currentBranch();
+  if (!branch || branch === "main") fail("ds-l fix 必须在任务 worktree 分支运行，不能直接在 main 上运行。");
   const beforeHead = currentHead();
 
   const currentFixIteration = Number.isInteger(state.review?.fix_iteration)
@@ -1783,12 +1785,13 @@ function commandFix() {
     if (status) gateError = `Fix 结束后 worktree 不干净：\n${status}`;
   }
   if (latestState) {
-    const failed = Boolean(result.error) || (result.status ?? 1) !== 0 || Boolean(gateError);
+    const incomplete = Boolean(summary?.active);
+    const failed = Boolean(result.error) || (result.status ?? 1) !== 0 || Boolean(gateError) || incomplete;
     saveState(latestState, {
       phase: "fix",
       status: failed ? "blocked" : "active",
       latest_error: failed
-        ? gateError || result.error?.message || `cc-leader drive exited ${result.status}`
+        ? gateError || result.error?.message || (incomplete ? "fix worker 尚未完成。" : `cc-leader drive exited ${result.status}`)
         : null,
       drive: {
         ...latestState.drive,
@@ -1950,6 +1953,7 @@ async function commandClose() {
   if (
     state.phase === "running" ||
     (state.phase === "blocked" && !resumableRebase) ||
+    (state.phase === "fix" && state.status === "blocked") ||
     ["implementing", "blocked", "not_started"].includes(state.delivery?.status)
   ) {
     fail("实现尚未成功完成，不能进入 ds-l close。");
