@@ -2,6 +2,7 @@
 
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import assert from "node:assert/strict";
 import {
   closeSync,
   existsSync,
@@ -34,11 +35,19 @@ const latestPaths = {
   driveSummary: path.join(codexDir, "drive-summary.json"),
   driveStdout: path.join(codexDir, "stdout.jsonl"),
   driveStderr: path.join(codexDir, "stderr.log"),
+  reviewSchema: path.join(codexDir, "review.schema.json"),
 };
+
+const reviewModel = "gpt-5.5";
+const reviewEffort = "xhigh";
 
 const legacyLatestJson = path.join(dsRoot, "latest.json");
 const legacyLatestPrompt = path.join(dsRoot, "latest.prompt.md");
-const commandNames = new Set(["spec", "plan", "task", "run", "review", "report", "fix"]);
+const commandNames = new Set(["spec", "plan", "task", "run", "review", "report", "fix", "close", "merge"]);
+const forceReview = rawArgs.includes("--force-review");
+const bugfix = rawArgs.includes("--bugfix");
+const verified = rawArgs.includes("--verified");
+const selfTest = rawArgs.includes("--self-test");
 
 const help = rawArgs.includes("-h") || rawArgs.includes("--help");
 const previewOnly =
@@ -68,6 +77,10 @@ const cleanArgs = rawArgs.filter(
       "-s",
       "--show-last",
       "--last",
+      "--force-review",
+      "--bugfix",
+      "--verified",
+      "--self-test",
     ].includes(arg),
 );
 
@@ -90,17 +103,23 @@ Phase 1 workflow 命令：
   ds-l task
     读取 latest/spec.md + plan.md + acceptance.md，调 DeepSeek 生成 latest/task.md 和 worker.prompt.md。
 
-  ds-l run
-    读取 latest/worker.prompt.md，调用 cc-leader drive 执行，不重新生成计划。
+  ds-l run [--bugfix]
+    记录 git base，调用 cc-leader drive 实现、验证并提交；结束时 worktree 必须干净。
+
+  ds-l close [--force-review] [--bugfix]
+    fetch/rebase origin/main 后执行提交范围审核；修复、验证、提交并复审，最多 5 轮。
 
   ds-l review
-    读取 latest 产物、Codex Worker 输出、git status/diff/cached diff/untracked text files，调 DeepSeek 判断执行是否通过。
+    强制使用 gpt-5.5/xhigh 独立审核当前 review_base..HEAD；显式调用时不适用小改动跳过规则。
 
   ds-l fix
-    manual-only：仅当 latest review verdict 为 needs_fix 时，生成 fix.prompt.md 并调用 cc-leader drive 手动修复；不会自动 review/report 或循环。
+    仅当 verdict 为 needs_fix 时，裁决 findings，修复成立的 blocker/high/medium，验证并提交。
 
   ds-l report
     读取 latest 产物、review、Codex Worker 输出、git status/diff/cached diff/untracked text files，调 DeepSeek 生成最终报告。
+
+  ds-l merge [--verified]
+    将已通过最终审核的任务分支 ff-only 合回 main 并 push；bugfix 必须传 --verified。
 
 兼容快捷方式：
 
@@ -206,7 +225,7 @@ function artifactPaths() {
 function baseState(originalRequest, title) {
   const createdAt = nowIso();
   return {
-    schema_version: 1,
+    schema_version: 2,
     workflow_id: createWorkflowId(),
     created_at: createdAt,
     updated_at: createdAt,
@@ -231,9 +250,24 @@ function baseState(originalRequest, title) {
       summary: null,
       needs: [],
       fix_iteration: 0,
+      round: 0,
+      findings: [],
+      audited_head_sha: null,
+      skipped: false,
     },
     limits: {
-      max_fix_iterations: 2,
+      max_fix_iterations: 5,
+      max_review_rounds: 5,
+    },
+    git: {
+      start_sha: null,
+      review_base_sha: null,
+      head_sha: null,
+      audited_upstream_sha: null,
+    },
+    delivery: {
+      bugfix: false,
+      status: "not_started",
     },
     latest_error: null,
     next_recommended_command: "ds-l plan",
@@ -306,13 +340,16 @@ function suggestNext(state) {
   if (state.phase === "plan") return "ds-l task";
   if (state.phase === "task") return "ds-l run";
   if (state.phase === "running") return "ds-l -s";
-  if (state.phase === "run") return "ds-l review";
+  if (state.phase === "run") return "ds-l close";
   if (state.phase === "review") {
     if (state.review?.verdict === "pass") return "ds-l report";
     if (state.review?.verdict === "needs_fix") return "ds-l fix";
     if (state.review?.verdict === "needs_user_decision") return "Review needs user decision";
   }
-  if (state.phase === "fix") return "ds-l review";
+  if (state.phase === "fix") return "ds-l close";
+  if (state.phase === "closed") {
+    return state.delivery?.bugfix ? "ds-l merge --verified" : "ds-l merge";
+  }
   if (state.phase === "report") return state.next_recommended_command || "ds-l -s";
   return "ds-l -s";
 }
@@ -328,6 +365,50 @@ function shell(cmd) {
     stdout: result.stdout || "",
     stderr: result.stderr || "",
   };
+}
+
+function runGit(args, cwd = root) {
+  return spawnSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024 * 20,
+  });
+}
+
+function gitText(args, label = `git ${args.join(" ")}`, cwd = root) {
+  const result = runGit(args, cwd);
+  if (result.error || (result.status ?? 1) !== 0) {
+    fail(
+      `${label} failed\n${result.error?.message || result.stderr || result.stdout || `exit ${result.status}`}`,
+    );
+  }
+  return (result.stdout || "").trim();
+}
+
+function currentHead() {
+  return gitText(["rev-parse", "HEAD"], "读取当前 HEAD");
+}
+
+function currentBranch(cwd = root) {
+  return gitText(["branch", "--show-current"], "读取当前分支", cwd);
+}
+
+function worktreeStatus(cwd = root) {
+  return gitText(["status", "--porcelain"], "读取 worktree 状态", cwd);
+}
+
+function requireCleanWorktree(stage, cwd = root) {
+  const status = worktreeStatus(cwd);
+  if (status) fail(`${stage} 要求干净 worktree，请先提交或处理以下改动：\n${status}`);
+}
+
+function requireCommitRange(base, head) {
+  if (!base) fail("缺少 review_base_sha；请重新运行 ds-l run。 ");
+  const result = runGit(["merge-base", "--is-ancestor", base, head]);
+  if ((result.status ?? 1) !== 0) {
+    fail(`审核基线 ${base} 不是 HEAD ${head} 的祖先；请运行 ds-l close 重新 rebase。`);
+  }
+  if (base === head) fail("git base 到 HEAD 之间没有提交，无法审核。");
 }
 
 function projectInfo() {
@@ -730,8 +811,10 @@ ${dsWorkerPrompt}
 6. 你可以做一次实现自检，但只检查是否符合 DS Task 和是否有真实 bug。
 7. 禁止自己 review 自己并自动循环修复。
 8. 禁止完成后继续提出并执行下一轮改动。
-9. 遇到真实 blocker 时停止并说明 blocker。
-10. 最终输出：
+9. 完成最小验证后，按关注点创建 git commit；不要把无关改动混入提交。
+10. 结束前确认 git status --porcelain 为空；存在无法提交的改动时停止并说明。
+11. 遇到真实 blocker 时停止并说明 blocker。
+12. 最终输出：
    - 修改了哪些文件
    - 如何运行
    - 验证结果
@@ -1140,17 +1223,45 @@ ${workerStderr || "(empty)"}`;
 }
 
 function commandRun() {
-  const workerPrompt = loadLatestWorkerPrompt();
-  ensureLatestDirs();
   const state = readState();
-  if (state) {
-    saveState(state, {
-      phase: "running",
-      status: "active",
-      latest_error: null,
-      next_recommended_command: "ds-l -s",
-    });
-  }
+  if (!state) fail('没有 latest state。请先运行: ds-l spec "需求"');
+  requireCleanWorktree("ds-l run");
+  const startSha = currentHead();
+  const isBugfix = bugfix || state.delivery?.bugfix || false;
+  const workerPrompt = `${loadLatestWorkerPrompt()}
+
+【Git 交付要求】
+完成最小验证后按关注点提交全部任务改动。结束前必须确认 git status --porcelain 为空。`;
+  ensureLatestDirs();
+  saveState(state, {
+    phase: "running",
+    status: "active",
+    latest_error: null,
+    git: {
+      ...state.git,
+      start_sha: startSha,
+      review_base_sha: startSha,
+      head_sha: startSha,
+      audited_upstream_sha: null,
+    },
+    review: {
+      ...state.review,
+      verdict: null,
+      summary: null,
+      needs: [],
+      fix_iteration: 0,
+      round: 0,
+      findings: [],
+      audited_head_sha: null,
+      skipped: false,
+    },
+    delivery: {
+      ...state.delivery,
+      bugfix: isBugfix,
+      status: "implementing",
+    },
+    next_recommended_command: "ds-l -s",
+  });
 
   console.log("\nStarting cc-leader drive with latest Codex worker prompt...\n");
   const result = spawnSync("cc-leader", ["drive", workerPrompt], {
@@ -1180,12 +1291,22 @@ function commandRun() {
   }
 
   const latestState = readState();
+  let gateError = null;
+  let headSha = startSha;
+  if (!result.error && (result.status ?? 1) === 0) {
+    headSha = currentHead();
+    const status = worktreeStatus();
+    if (status) gateError = `Worker 结束后 worktree 不干净：\n${status}`;
+    else if (headSha === startSha) gateError = "Worker 没有创建任务提交。";
+  }
   if (latestState) {
-    const failed = Boolean(result.error) || (result.status ?? 1) !== 0;
+    const failed = Boolean(result.error) || (result.status ?? 1) !== 0 || Boolean(gateError);
     saveState(latestState, {
       phase: failed ? "blocked" : summary?.active ? "running" : "run",
       status: failed ? "blocked" : "active",
-      latest_error: failed ? result.error?.message || `cc-leader drive exited ${result.status}` : null,
+      latest_error: failed
+        ? gateError || result.error?.message || `cc-leader drive exited ${result.status}`
+        : null,
       drive: {
         ...latestState.drive,
         drive_id: summary?.drive_id ?? latestState.drive?.drive_id ?? null,
@@ -1197,16 +1318,202 @@ function commandRun() {
         stdout_log: summary?.stdout_log ?? repoRel(latestPaths.driveStdout),
         stderr_log: summary?.stderr_log ?? repoRel(latestPaths.driveStderr),
       },
+      git: {
+        ...latestState.git,
+        head_sha: headSha,
+      },
+      delivery: {
+        ...latestState.delivery,
+        status: failed ? "blocked" : "implemented",
+      },
       next_recommended_command: failed
         ? "ds-l -s"
-        : "ds-l review",
+        : "ds-l close",
     });
   }
 
   if (result.error) {
     fail(result.error.message);
   }
+  if (gateError) fail(gateError);
   process.exit(result.status ?? 0);
+}
+
+function summarizeChangeStats(namesText, numstatText) {
+  const files = namesText.split("\0").filter(Boolean);
+  let added = 0;
+  let deleted = 0;
+  let binary = false;
+  for (const line of numstatText.split("\n").filter(Boolean)) {
+    const [add, del] = line.split("\t", 2);
+    if (add === "-" || del === "-") binary = true;
+    else {
+      added += Number(add) || 0;
+      deleted += Number(del) || 0;
+    }
+  }
+  return {
+    files,
+    added,
+    deleted,
+    binary,
+    can_skip_review: files.length === 1 && !binary && added + deleted <= 10,
+  };
+}
+
+function commitRangeInputs(base, head) {
+  requireCommitRange(base, head);
+  const range = `${base}..${head}`;
+  const names = gitText(["diff", "--name-only", "-z", range], "读取变更文件");
+  const numstat = gitText(["diff", "--numstat", range], "读取变更行数");
+  return {
+    base,
+    head,
+    range,
+    commits: gitText(["log", "--format=%H %s", range], "读取提交记录"),
+    diff: gitText(["diff", "--no-ext-diff", "--find-renames", range], "读取提交范围 diff"),
+    stats: summarizeChangeStats(names, numstat),
+  };
+}
+
+function formatCommitRangeEvidence(evidence) {
+  return `## Authoritative git evidence
+
+Review range: ${evidence.range}
+
+### Commits
+
+${evidence.commits}
+
+### Changed files
+
+${evidence.stats.files.join("\n")}
+
+### Diff
+
+${evidence.diff}`;
+}
+
+function normalizeFindings(value) {
+  if (!Array.isArray(value)) throw new Error("Reviewer findings 必须是数组。");
+  const severities = new Set(["blocker", "high", "medium", "low"]);
+  return value.map((finding, index) => {
+    const severity = String(finding?.severity || "").toLowerCase();
+    if (!severities.has(severity)) throw new Error(`Reviewer finding ${index + 1} severity 非法。`);
+    return {
+      id: `R${index + 1}`,
+      severity,
+      title: requireString(finding.title, `findings[${index}].title`),
+      file: requireString(finding.file, `findings[${index}].file`),
+      line: Number.isInteger(finding.line) ? finding.line : null,
+      evidence: requireString(finding.evidence, `findings[${index}].evidence`),
+      task_impact: requireString(finding.task_impact, `findings[${index}].task_impact`),
+    };
+  });
+}
+
+function reviewerSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      summary: { type: "string" },
+      findings: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            severity: { type: "string", enum: ["blocker", "high", "medium", "low"] },
+            title: { type: "string" },
+            file: { type: "string" },
+            line: { type: ["integer", "null"] },
+            evidence: { type: "string" },
+            task_impact: { type: "string" },
+          },
+          required: ["severity", "title", "file", "line", "evidence", "task_impact"],
+        },
+      },
+    },
+    required: ["summary", "findings"],
+  };
+}
+
+function runReviewAgent(prompt, round) {
+  ensureLatestDirs();
+  writeJson(latestPaths.reviewSchema, reviewerSchema());
+  const lastMessage = path.join(codexDir, `review-round-${round}.json`);
+  const stdoutFile = path.join(codexDir, `review-round-${round}.stdout.jsonl`);
+  const stderrFile = path.join(codexDir, `review-round-${round}.stderr.log`);
+  const result = spawnSync(
+    "codex",
+    [
+      "exec",
+      "--json",
+      "--ephemeral",
+      "--strict-config",
+      "-m",
+      reviewModel,
+      "-c",
+      `model_reasoning_effort=\"${reviewEffort}\"`,
+      "-s",
+      "read-only",
+      "-a",
+      "never",
+      "--output-schema",
+      latestPaths.reviewSchema,
+      "-o",
+      lastMessage,
+      "-",
+    ],
+    {
+      cwd: root,
+      input: prompt,
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024 * 20,
+      env: process.env,
+    },
+  );
+  writeRawText(stdoutFile, result.stdout || "");
+  writeRawText(stderrFile, result.stderr || "");
+  if (result.error || (result.status ?? 1) !== 0) {
+    fail(
+      `gpt-5.5/xhigh reviewer failed\n${result.error?.message || result.stderr || result.stdout || `exit ${result.status}`}`,
+    );
+  }
+  return parseJsonLoose(readRequiredStateFile(lastMessage, `review round ${round} output`));
+}
+
+function reviewMarkdown({ verdict, summary, findings, base, head, skipped = false }) {
+  const lines = [
+    "# DS Review",
+    "",
+    "## Verdict",
+    "",
+    verdict,
+    "",
+    "## Scope",
+    "",
+    `- Base: ${base}`,
+    `- Head: ${head}`,
+    `- Reviewer: ${skipped ? "skipped by size rule" : `${reviewModel}/${reviewEffort}`}`,
+    "",
+    "## Summary",
+    "",
+    summary,
+    "",
+    "## Findings",
+    "",
+  ];
+  if (!findings.length) lines.push("- None");
+  for (const finding of findings) {
+    lines.push(
+      `- **${finding.id} ${finding.severity.toUpperCase()}** ${finding.file}${finding.line ? `:${finding.line}` : ""} — ${finding.title}`,
+      `  - Evidence: ${finding.evidence}`,
+      `  - Task impact: ${finding.task_impact}`,
+    );
+  }
+  return lines.join("\n");
 }
 
 function requireVerdict(value) {
@@ -1218,133 +1525,49 @@ function requireVerdict(value) {
   return verdict;
 }
 
-function normalizeNeeds(value) {
-  if (value == null) return [];
-  if (!Array.isArray(value)) {
-    throw new Error("DeepSeek JSON 字段 needs 必须是数组。");
-  }
-  return value.map((item) => String(item).trim()).filter(Boolean);
-}
-
-function fallbackReviewMarkdown({ verdict, summary, needs }) {
-  const needsMd = needs.length ? needs.map((item) => `- ${item}`).join("\n") : "- None";
-  return `# DS Review
-
-## Verdict
-
-${verdict}
-
-## Summary
-
-${summary}
-
-## Needs
-
-${needsMd}
-`;
-}
-
 async function commandReview() {
   const state = readState();
   if (!state) fail('没有 latest state。请先运行: ds-l spec "需求"');
-
-  const spec = readRequiredText(latestPaths.spec, "spec.md", 'ds-l spec "需求"');
-  const plan = readRequiredText(latestPaths.plan, "plan.md", "ds-l plan");
+  requireCleanWorktree("ds-l review");
   const task = readRequiredText(latestPaths.task, "task.md", "ds-l task");
   const acceptance = readRequiredText(latestPaths.acceptance, "acceptance.md", 'ds-l spec "需求"');
-  const workerPrompt = readRequiredText(latestPaths.workerPrompt, "worker.prompt.md", "ds-l task");
-  const workerLastMessage = readRequiredStateFile(
-    state.drive?.last_message_file,
-    "state.drive.last_message_file",
-  );
-  const workerStderr = readRequiredStateFile(state.drive?.stderr_log, "state.drive.stderr_log");
-  const workspaceInputs = workspaceReviewInputs();
+  const head = currentHead();
+  const base = state.git?.review_base_sha || state.git?.start_sha;
+  const evidence = commitRangeInputs(base, head);
+  const round = (Number.isInteger(state.review?.round) ? state.review.round : 0) + 1;
+  const maxRounds = Number.isInteger(state.limits?.max_review_rounds)
+    ? state.limits.max_review_rounds
+    : 5;
+  if (round > maxRounds) fail(`审核已达到最多 ${maxRounds} 轮，请人工处理剩余问题。`);
 
-  const parsed = await callDeepSeekJson(
-    "review",
-    `${baseSystemPrompt}
+  const parsed = runReviewAgent(
+    `You are an independent code-review sub-agent. Review only code facts in the supplied git range.
+Do not rely on prior agent memory, worker claims, or uncommitted workspace state.
+Find only blocker, high, medium, and low issues. A finding must cite concrete file evidence and explain impact on the task goal.
+Do not report stylistic preferences. Return JSON matching the supplied schema.
 
-当前阶段：review。
-你必须审查 Codex Worker 的执行是否符合 spec / plan / acceptance。
-禁止要求自动 fix 循环，禁止生成 report。
-verdict 只能是 pass、needs_fix、needs_user_decision 三者之一。
-
-最高优先级规则：
-- Current workspace evidence is authoritative.
-- Current file contents override Worker last-message and drive logs.
-- Worker last-message is historical and may be stale.
-- If current file contents conflict with acceptance, verdict must be needs_fix, even if Worker logs claim success.
-
-硬性判定规则：
-- If a required output file is present in current workspace evidence and its current content violates acceptance, verdict must be needs_fix.
-- If current executable output is available and violates acceptance, verdict must be needs_fix.
-- Do not mark pass based only on Worker summary if current workspace evidence contradicts it.
-- If current workspace evidence includes untracked file contents, review those contents before historical Worker logs.
-
-输出 JSON schema:
-{
-  "verdict": "pass | needs_fix | needs_user_decision",
-  "summary": "简短审查总结",
-  "needs": ["needs_fix 时列出需要修复的问题；needs_user_decision 时列出需要用户确认的问题；pass 时可为空数组"],
-  "review_md": "完整 Markdown review，必须包含 Verdict、Summary、Evidence、Needs"
-}
-`,
-    `用户原始需求：
-
+Original task:
 ${state.original_request || "(unknown)"}
 
-state.json:
-
-${JSON.stringify(state, null, 2)}
-
-spec.md:
-
-${spec}
-
-plan.md:
-
-${plan}
-
-task.md:
-
+Task definition:
 ${task}
 
-acceptance.md:
-
+Acceptance criteria:
 ${acceptance}
 
-${formatCurrentWorkspaceEvidence(workspaceInputs)}
-
-worker.prompt.md:
-
-${workerPrompt}
-
-${formatHistoricalWorkerLogs({ workerLastMessage, workerStderr })}
-
-请基于以上材料判断 Worker 是否满足 spec、plan、acceptance。
-要求：
-1. 如果实现满足验收标准且没有明显阻塞，verdict=pass。
-2. 如果需要代码修复，verdict=needs_fix，并在 needs 中列出具体修复项。
-3. 如果不能安全判断或需要产品/用户取舍，verdict=needs_user_decision，并在 needs 中说明用户必须确认什么。
-4. 不要启动或建议自动修复循环。
-5. 不要生成 report。
-`,
+${formatCommitRangeEvidence(evidence)}`,
+    round,
   );
 
-  const verdict = requireVerdict(parsed.verdict);
   const summary = requireString(parsed.summary, "summary");
-  const parsedNeeds = normalizeNeeds(parsed.needs);
-  const needs = verdict === "pass" || parsedNeeds.length ? parsedNeeds : [summary];
-  const reviewMd =
-    typeof parsed.review_md === "string" && parsed.review_md.trim()
-      ? parsed.review_md.trim()
-      : fallbackReviewMarkdown({ verdict, summary, needs });
-  const nextRecommendedCommand =
-    verdict === "pass"
-      ? "ds-l report"
-      : verdict === "needs_fix"
-        ? "ds-l fix"
-        : "Review needs user decision";
+  const findings = normalizeFindings(parsed.findings);
+  const blocking = findings.filter((finding) => finding.severity !== "low");
+  const verdict = blocking.length ? "needs_fix" : "pass";
+  const needs = blocking.map(
+    (finding) => `${finding.id} ${finding.severity}: ${finding.file}${finding.line ? `:${finding.line}` : ""} ${finding.title}`,
+  );
+  const reviewMd = reviewMarkdown({ verdict, summary, findings, base, head });
+  const nextRecommendedCommand = verdict === "pass" ? "ds-l report" : "ds-l fix";
 
   writeText(latestPaths.review, reviewMd);
   saveState(state, {
@@ -1356,6 +1579,17 @@ ${formatHistoricalWorkerLogs({ workerLastMessage, workerStderr })}
       verdict,
       summary,
       needs,
+      findings,
+      round,
+      audited_head_sha: verdict === "pass" ? head : null,
+      model: reviewModel,
+      effort: reviewEffort,
+      skipped: false,
+    },
+    git: {
+      ...state.git,
+      head_sha: head,
+      audited_upstream_sha: verdict === "pass" ? base : null,
     },
     next_recommended_command: nextRecommendedCommand,
   });
@@ -1394,26 +1628,24 @@ function buildFixPrompt({
   report,
   workerLastMessage,
   workerStderr,
-  workspaceInputs,
+  rangeEvidence,
 }) {
   return `
 你是 Codex Worker。当前是 DS workflow 的手动 fix 阶段。
 
 【硬性边界】
-1. 只修复 review.md 中列出的 needs_fix 问题。
+1. 先逐项判断 review finding 是否成立；明确记录误报，成立的 blocker/high/medium 必须修复，low 不阻塞。
 2. 不要做无关重构。
 3. 不要扩大需求或新增未要求的功能。
 4. 不要删除无关文件。
 5. 不要自动调用 ds-l review。
 6. 不要自动调用 ds-l report。
 7. 不要实现 fix -> review -> fix 自动循环。
-8. 修复后运行必要验证；无法运行时说明原因。
-9. 最终输出修复摘要，包括修改文件、修复的问题、验证结果、剩余风险。
-10. 只根据当前 review.md 和 Current workspace evidence 当前工作区事实修复。
-11. Current workspace evidence is authoritative.
-12. Current file contents override Worker last-message and drive logs.
-13. Worker last-message is historical and may be stale.
-14. Historical worker logs 仅供背景，不得覆盖当前 review.md 或当前文件内容。
+8. 修复后运行必要的最小验证并提交修复；无法运行时说明原因。
+9. 结束前确认 git status --porcelain 为空。
+10. 最终输出修复摘要，包括成立/误报判断、修改文件、验证结果、提交和剩余风险。
+11. Git range evidence 和当前文件内容是权威事实。
+12. Worker 历史日志仅供背景，不得覆盖代码事实。
 
 【用户原始需求】
 ${state.original_request || "(unknown)"}
@@ -1436,7 +1668,7 @@ ${acceptance}
 【review.md】
 ${review}
 
-${formatCurrentWorkspaceEvidence(workspaceInputs)}
+${formatCommitRangeEvidence(rangeEvidence)}
 
 【worker.prompt.md】
 ${workerPrompt}
@@ -1446,7 +1678,7 @@ ${report || "(not present)"}
 
 ${formatHistoricalWorkerLogs({ workerLastMessage, workerStderr })}
 
-请根据 review.md 中的 needs_fix 条目进行最小必要修复。完成后停止，输出修复摘要。
+请裁决 review.md 中的 findings，完成成立问题的最小修复、验证和提交后停止。
 `;
 }
 
@@ -1464,13 +1696,15 @@ function commandFix() {
   if (verdict !== "needs_fix") {
     fail(`review.verdict = ${verdict}，ds-l fix 只允许在 needs_fix 时运行。`);
   }
+  requireCleanWorktree("ds-l fix");
+  const beforeHead = currentHead();
 
   const currentFixIteration = Number.isInteger(state.review?.fix_iteration)
     ? state.review.fix_iteration
     : 0;
   const maxFixIterations = Number.isInteger(state.limits?.max_fix_iterations)
     ? state.limits.max_fix_iterations
-    : 2;
+    : 5;
   if (currentFixIteration >= maxFixIterations) {
     fail(
       `fix_iteration 已达到 limits.max_fix_iterations (${currentFixIteration}/${maxFixIterations})，请人工检查 review.md 后再决定下一步。`,
@@ -1490,7 +1724,10 @@ function commandFix() {
     "state.drive.last_message_file",
   );
   const workerStderr = readRequiredStateFile(state.drive?.stderr_log, "state.drive.stderr_log");
-  const workspaceInputs = workspaceReviewInputs();
+  const rangeEvidence = commitRangeInputs(
+    state.git?.review_base_sha || state.git?.start_sha,
+    beforeHead,
+  );
   const fixPrompt = buildFixPrompt({
     stateJson,
     state,
@@ -1503,7 +1740,7 @@ function commandFix() {
     report,
     workerLastMessage,
     workerStderr,
-    workspaceInputs,
+    rangeEvidence,
   });
 
   ensureLatestDirs();
@@ -1537,12 +1774,21 @@ function commandFix() {
   }
 
   const latestState = readState();
+  let gateError = null;
+  let afterHead = beforeHead;
+  if (!result.error && (result.status ?? 1) === 0) {
+    afterHead = currentHead();
+    const status = worktreeStatus();
+    if (status) gateError = `Fix 结束后 worktree 不干净：\n${status}`;
+  }
   if (latestState) {
-    const failed = Boolean(result.error) || (result.status ?? 1) !== 0;
+    const failed = Boolean(result.error) || (result.status ?? 1) !== 0 || Boolean(gateError);
     saveState(latestState, {
       phase: "fix",
       status: failed ? "blocked" : "active",
-      latest_error: failed ? result.error?.message || `cc-leader drive exited ${result.status}` : null,
+      latest_error: failed
+        ? gateError || result.error?.message || `cc-leader drive exited ${result.status}`
+        : null,
       drive: {
         ...latestState.drive,
         drive_id: summary?.drive_id ?? latestState.drive?.drive_id ?? null,
@@ -1557,8 +1803,14 @@ function commandFix() {
       review: {
         ...latestState.review,
         fix_iteration: currentFixIteration + 1,
+        audited_head_sha: null,
       },
-      next_recommended_command: "ds-l review",
+      git: {
+        ...latestState.git,
+        head_sha: afterHead,
+        audited_upstream_sha: null,
+      },
+      next_recommended_command: failed ? "ds-l -s" : "ds-l review",
     });
   }
 
@@ -1568,7 +1820,201 @@ function commandFix() {
   if (result.error) {
     fail(result.error.message);
   }
-  process.exit(result.status ?? 0);
+  if (gateError) fail(gateError);
+  if ((result.status ?? 1) !== 0) fail(`cc-leader drive exited ${result.status}`);
+  return readState();
+}
+
+function runGitStep(args, label, cwd = root) {
+  const result = runGit(args, cwd);
+  if (result.error || (result.status ?? 1) !== 0) {
+    fail(`${label} failed\n${result.error?.message || result.stderr || result.stdout || `exit ${result.status}`}`);
+  }
+  return result;
+}
+
+function prepareReviewBase(state) {
+  requireCleanWorktree("ds-l close");
+  const branch = currentBranch();
+  if (!branch) fail("ds-l close 不支持 detached HEAD。");
+  if (branch === "main") fail("ds-l close 必须在任务 worktree 分支运行，不能直接在 main 上运行。");
+
+  runGitStep(["fetch", "origin"], "git fetch origin");
+  const upstream = gitText(["rev-parse", "origin/main"], "读取 origin/main");
+  const rebase = runGit(["rebase", "origin/main"]);
+  if (rebase.error || (rebase.status ?? 1) !== 0) {
+    saveState(state, {
+      phase: "blocked",
+      status: "blocked",
+      latest_error: "git rebase origin/main 失败；解决冲突并提交后重新运行 ds-l close。",
+      delivery: { ...state.delivery, status: "blocked" },
+      next_recommended_command: "ds-l close",
+    });
+    fail(`git rebase origin/main failed\n${rebase.error?.message || rebase.stderr || rebase.stdout}`);
+  }
+
+  requireCleanWorktree("rebase 后审核");
+  const head = currentHead();
+  const stale = state.git?.review_base_sha !== upstream || state.git?.head_sha !== head;
+  return saveState(state, {
+    git: {
+      ...state.git,
+      review_base_sha: upstream,
+      head_sha: head,
+      audited_upstream_sha: stale ? null : state.git?.audited_upstream_sha,
+    },
+    review: stale
+      ? {
+          ...state.review,
+          verdict: null,
+          summary: null,
+          needs: [],
+          findings: [],
+          audited_head_sha: null,
+          skipped: false,
+        }
+      : state.review,
+    delivery: {
+      ...state.delivery,
+      bugfix: bugfix || state.delivery?.bugfix || false,
+      status: "reviewing",
+    },
+    next_recommended_command: "ds-l close",
+  });
+}
+
+function markReviewSkipped(state, evidence) {
+  const summary = `单文件且代码改动 ${evidence.stats.added + evidence.stats.deleted} 行，按规则跳过审核。`;
+  writeText(
+    latestPaths.review,
+    reviewMarkdown({
+      verdict: "pass",
+      summary,
+      findings: [],
+      base: evidence.base,
+      head: evidence.head,
+      skipped: true,
+    }),
+  );
+  return saveState(state, {
+    phase: "review",
+    status: "active",
+    review: {
+      ...state.review,
+      verdict: "pass",
+      summary,
+      needs: [],
+      findings: [],
+      audited_head_sha: evidence.head,
+      skipped: true,
+    },
+    git: {
+      ...state.git,
+      head_sha: evidence.head,
+      audited_upstream_sha: evidence.base,
+    },
+  });
+}
+
+function finalizeClose(state) {
+  const isBugfix = bugfix || state.delivery?.bugfix || false;
+  const status = isBugfix ? "awaiting_user_validation" : "ready_to_merge";
+  const next = isBugfix ? "ds-l merge --verified" : "ds-l merge";
+  const nextState = saveState(state, {
+    phase: "closed",
+    status: "active",
+    delivery: { ...state.delivery, bugfix: isBugfix, status },
+    next_recommended_command: next,
+  });
+  console.log(`完成：${state.title || state.original_request || "DS task"}`);
+  console.log(`Next: ${next}\n`);
+  return nextState;
+}
+
+async function commandClose() {
+  let state = readState();
+  if (!state) fail('没有 latest state。请先运行: ds-l spec "需求"');
+  state = prepareReviewBase(state);
+  let head = currentHead();
+  const evidence = commitRangeInputs(state.git?.review_base_sha, head);
+  const explicitlyRequested = forceReview || /审核|review/i.test(state.original_request || "");
+
+  if (
+    state.review?.verdict !== "pass" &&
+    (state.review?.round || 0) === 0 &&
+    evidence.stats.can_skip_review &&
+    !explicitlyRequested
+  ) {
+    state = markReviewSkipped(state, evidence);
+  }
+
+  while (
+    state.review?.verdict !== "pass" ||
+    state.review?.audited_head_sha !== head ||
+    state.git?.audited_upstream_sha !== state.git?.review_base_sha
+  ) {
+    if (state.phase === "review" && state.review?.verdict === "needs_fix") {
+      const maxRounds = state.limits?.max_review_rounds || 5;
+      if ((state.review?.round || 0) >= maxRounds) {
+        fail(`审核已达到最多 ${maxRounds} 轮，仍有 blocker/high/medium，请人工处理。`);
+      }
+      state = commandFix();
+    } else {
+      state = await commandReview();
+    }
+    head = currentHead();
+  }
+
+  return finalizeClose(state);
+}
+
+function mainWorktreePath() {
+  const output = gitText(["worktree", "list", "--porcelain"], "读取 git worktree");
+  for (const record of output.split("\n\n")) {
+    const lines = record.split("\n");
+    const worktree = lines.find((line) => line.startsWith("worktree "))?.slice(9);
+    const branch = lines.find((line) => line.startsWith("branch "))?.slice(7);
+    if (worktree && branch === "refs/heads/main") return worktree;
+  }
+  fail("找不到检出 main 分支的 worktree，无法执行 ff-only 合回。");
+}
+
+function commandMerge() {
+  const state = readState();
+  if (!state) fail('没有 latest state。请先运行: ds-l close');
+  requireCleanWorktree("ds-l merge");
+  const branch = currentBranch();
+  if (!branch || branch === "main") fail("ds-l merge 必须从任务 worktree 分支运行。");
+  const head = currentHead();
+  if (state.review?.verdict !== "pass" || state.review?.audited_head_sha !== head) {
+    fail("当前 HEAD 未通过最终审核，请先运行 ds-l close。");
+  }
+  if (state.delivery?.bugfix && !verified) {
+    fail("bugfix 必须由用户确认验证通过后运行: ds-l merge --verified");
+  }
+
+  runGitStep(["fetch", "origin"], "git fetch origin");
+  const upstream = gitText(["rev-parse", "origin/main"], "读取 origin/main");
+  if (upstream !== state.git?.audited_upstream_sha) {
+    saveState(state, {
+      delivery: { ...state.delivery, status: "upstream_changed" },
+      next_recommended_command: state.delivery?.bugfix ? "ds-l close --bugfix" : "ds-l close",
+    });
+    fail("origin/main 在最终审核后发生变化；请重新运行 ds-l close，复审后再合回。");
+  }
+
+  const mainPath = mainWorktreePath();
+  requireCleanWorktree("main worktree 合回", mainPath);
+  runGitStep(["merge", "--ff-only", "origin/main"], "main 更新到 origin/main", mainPath);
+  runGitStep(["merge", "--ff-only", branch], `main ff-only merge ${branch}`, mainPath);
+  runGitStep(["push", "origin", "main"], "git push origin main", mainPath);
+  saveState(state, {
+    phase: "merged",
+    status: "completed",
+    delivery: { ...state.delivery, status: "pushed", user_verified: Boolean(verified) },
+    next_recommended_command: "ds-l report",
+  });
+  console.log(`完成：${state.title || state.original_request || branch} 已 ff-only 合回 main 并 push。`);
 }
 
 function reportNextCommand(verdict) {
@@ -1772,7 +2218,38 @@ function showLatestStatus() {
   console.log(`\nNext: ${suggestNext(state)}\n`);
 }
 
+function runSelfTest() {
+  assert.deepEqual(summarizeChangeStats("a.js\0", "5\t5\ta.js"), {
+    files: ["a.js"],
+    added: 5,
+    deleted: 5,
+    binary: false,
+    can_skip_review: true,
+  });
+  assert.equal(summarizeChangeStats("a.js\0b.js\0", "1\t0\ta.js\n1\t0\tb.js").can_skip_review, false);
+  assert.equal(summarizeChangeStats("a.js\0", "11\t0\ta.js").can_skip_review, false);
+  assert.equal(summarizeChangeStats("image.png\0", "-\t-\timage.png").can_skip_review, false);
+  assert.equal(
+    normalizeFindings([
+      {
+        severity: "high",
+        title: "broken",
+        file: "a.js",
+        line: 1,
+        evidence: "fact",
+        task_impact: "fails",
+      },
+    ])[0].severity,
+    "high",
+  );
+  console.log("ds-l self-test: pass");
+}
+
 async function main() {
+  if (selfTest) {
+    runSelfTest();
+    return;
+  }
   if (help) {
     printHelp();
     return;
@@ -1815,6 +2292,16 @@ async function main() {
 
   if (command === "review") {
     await commandReview();
+    return;
+  }
+
+  if (command === "close") {
+    await commandClose();
+    return;
+  }
+
+  if (command === "merge") {
+    commandMerge();
     return;
   }
 
