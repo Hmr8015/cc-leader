@@ -930,7 +930,7 @@ function parseDriveSummary(stdout) {
 }
 
 function driveIncomplete(summary) {
-  return !summary || summary.active || summary.stop_reason !== "completed";
+  return !summary || summary.active || summary.stop_reason !== "completed" || summary.last_exit_code !== 0;
 }
 
 function runDriveToCompletion(prompt) {
@@ -2064,7 +2064,8 @@ function commandMerge() {
 
   runGitStep(["fetch", "origin"], "git fetch origin");
   const upstream = gitText(["rev-parse", "origin/main"], "读取 origin/main");
-  if (upstream !== state.git?.audited_upstream_sha) {
+  const alreadyPushed = upstream === head;
+  if (!alreadyPushed && upstream !== state.git?.audited_upstream_sha) {
     saveState(state, {
       delivery: { ...state.delivery, status: "upstream_changed" },
       next_recommended_command: state.delivery?.bugfix ? "ds-l close --bugfix" : "ds-l close",
@@ -2078,7 +2079,9 @@ function commandMerge() {
   if ((runGit(["merge-base", "--is-ancestor", mainHead, head], mainPath).status ?? 1) !== 0) {
     fail("本地 main 无法 ff-only 到审核 HEAD，请先处理 main 分支状态。");
   }
-  runGitStep(["push", "origin", `${head}:refs/heads/main`], "push audited HEAD to origin/main", mainPath);
+  if (!alreadyPushed) {
+    runGitStep(["push", "origin", `${head}:refs/heads/main`], "push audited HEAD to origin/main", mainPath);
+  }
   runGitStep(["merge", "--ff-only", head], `main ff-only merge audited HEAD ${head}`, mainPath);
   saveState(state, {
     phase: "merged",
@@ -2291,8 +2294,9 @@ function showLatestStatus() {
 }
 
 function runSelfTest() {
-  assert.equal(driveIncomplete({ active: false, stop_reason: "completed" }), false);
-  assert.equal(driveIncomplete({ active: false, stop_reason: "waiting_for_user" }), true);
+  assert.equal(driveIncomplete({ active: false, stop_reason: "completed", last_exit_code: 0 }), false);
+  assert.equal(driveIncomplete({ active: false, stop_reason: "waiting_for_user", last_exit_code: 0 }), true);
+  assert.equal(driveIncomplete({ active: false, stop_reason: "completed", last_exit_code: 1 }), true);
   assert.equal(driveIncomplete(null), true);
   assert.equal(rejectedAllFindings({ latest_message: noChangeAdjudication }), true);
   assert.equal(rejectedAllFindings({ latest_message: "fixed" }), false);
