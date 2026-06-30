@@ -928,6 +928,10 @@ function parseDriveSummary(stdout) {
   }
 }
 
+function driveIncomplete(summary) {
+  return !summary || summary.active || summary.stop_reason !== "completed";
+}
+
 function resolveRepoPath(filePath) {
   if (!filePath) return null;
   return path.isAbsolute(filePath) ? filePath : path.join(root, filePath);
@@ -1283,6 +1287,7 @@ function commandRun() {
   if (stderr) process.stderr.write(stderr);
 
   const summary = parseDriveSummary(stdout);
+  const incomplete = driveIncomplete(summary);
   if (summary) {
     writeJson(latestPaths.driveSummary, summary);
   } else {
@@ -1304,12 +1309,12 @@ function commandRun() {
     else if (headSha === startSha) gateError = "Worker 没有创建任务提交。";
   }
   if (latestState) {
-    const failed = Boolean(result.error) || (result.status ?? 1) !== 0 || Boolean(gateError);
+    const failed = Boolean(result.error) || (result.status ?? 1) !== 0 || Boolean(gateError) || incomplete;
     saveState(latestState, {
       phase: failed ? "blocked" : summary?.active ? "running" : "run",
       status: failed ? "blocked" : "active",
       latest_error: failed
-        ? gateError || result.error?.message || `cc-leader drive exited ${result.status}`
+        ? gateError || result.error?.message || (incomplete ? `worker stop_reason=${summary?.stop_reason || "missing"}` : `cc-leader drive exited ${result.status}`)
         : null,
       drive: {
         ...latestState.drive,
@@ -1340,6 +1345,7 @@ function commandRun() {
     fail(result.error.message);
   }
   if (gateError) fail(gateError);
+  if (incomplete) fail(`worker stop_reason=${summary?.stop_reason || "missing"}`);
   process.exit(result.status ?? 0);
 }
 
@@ -1770,6 +1776,7 @@ function commandFix() {
   if (stderr) process.stderr.write(stderr);
 
   const summary = parseDriveSummary(stdout);
+  const incomplete = driveIncomplete(summary);
   if (summary) {
     writeJson(latestPaths.driveSummary, summary);
   } else {
@@ -1788,15 +1795,15 @@ function commandFix() {
     afterHead = currentHead();
     const status = worktreeStatus();
     if (status) gateError = `Fix 结束后 worktree 不干净：\n${status}`;
+    else if (afterHead === beforeHead) gateError = "Fix 没有创建修复提交。";
   }
   if (latestState) {
-    const incomplete = Boolean(summary?.active);
     const failed = Boolean(result.error) || (result.status ?? 1) !== 0 || Boolean(gateError) || incomplete;
     saveState(latestState, {
       phase: "fix",
       status: failed ? "blocked" : "active",
       latest_error: failed
-        ? gateError || result.error?.message || (incomplete ? "fix worker 尚未完成。" : `cc-leader drive exited ${result.status}`)
+        ? gateError || result.error?.message || (incomplete ? `fix worker stop_reason=${summary?.stop_reason || "missing"}` : `cc-leader drive exited ${result.status}`)
         : null,
       drive: {
         ...latestState.drive,
@@ -1831,6 +1838,7 @@ function commandFix() {
   }
   if (gateError) fail(gateError);
   if ((result.status ?? 1) !== 0) fail(`cc-leader drive exited ${result.status}`);
+  if (incomplete) fail(`fix worker stop_reason=${summary?.stop_reason || "missing"}`);
   return readState();
 }
 
@@ -1954,6 +1962,15 @@ function finalizeClose(state) {
 async function commandClose() {
   let state = readState();
   if (!state) fail('没有 latest state。请先运行: ds-l spec "需求"');
+  if (bugfix || forceReview) {
+    state = saveState(state, {
+      delivery: { ...state.delivery, bugfix: bugfix || state.delivery?.bugfix || false },
+      review: {
+        ...state.review,
+        explicitly_requested: forceReview || state.review?.explicitly_requested || false,
+      },
+    });
+  }
   const resumableRebase = state.delivery?.status === "rebase_conflict";
   if (
     state.phase === "running" ||
@@ -2258,6 +2275,9 @@ function showLatestStatus() {
 }
 
 function runSelfTest() {
+  assert.equal(driveIncomplete({ active: false, stop_reason: "completed" }), false);
+  assert.equal(driveIncomplete({ active: false, stop_reason: "waiting_for_user" }), true);
+  assert.equal(driveIncomplete(null), true);
   assert.deepEqual(summarizeChangeStats("a.js\0", "5\t5\ta.js"), {
     files: ["a.js"],
     added: 5,
