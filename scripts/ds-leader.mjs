@@ -1226,6 +1226,8 @@ function commandRun() {
   const state = readState();
   if (!state) fail('没有 latest state。请先运行: ds-l spec "需求"');
   requireCleanWorktree("ds-l run");
+  const branch = currentBranch();
+  if (!branch || branch === "main") fail("ds-l run 必须在任务 worktree 分支运行，不能直接在 main 上运行。");
   const startSha = currentHead();
   const isBugfix = bugfix || state.delivery?.bugfix || false;
   const workerPrompt = `${loadLatestWorkerPrompt()}
@@ -1525,7 +1527,7 @@ function requireVerdict(value) {
   return verdict;
 }
 
-async function commandReview() {
+async function commandReview({ enforceRoundLimit = false } = {}) {
   const state = readState();
   if (!state) fail('没有 latest state。请先运行: ds-l spec "需求"');
   requireCleanWorktree("ds-l review");
@@ -1538,7 +1540,9 @@ async function commandReview() {
   const maxRounds = Number.isInteger(state.limits?.max_review_rounds)
     ? state.limits.max_review_rounds
     : 5;
-  if (round > maxRounds) fail(`审核已达到最多 ${maxRounds} 轮，请人工处理剩余问题。`);
+  if (enforceRoundLimit && round > maxRounds) {
+    fail(`审核已达到最多 ${maxRounds} 轮，请人工处理剩余问题。`);
+  }
 
   const parsed = runReviewAgent(
     `You are an independent code-review sub-agent. Review only code facts in the supplied git range.
@@ -1833,9 +1837,9 @@ function runGitStep(args, label, cwd = root) {
   return result;
 }
 
-function reviewInvalidation(state, upstream, head, forced = false) {
+function reviewInvalidation(state, upstream, head, finalReview = false) {
   const upstreamChanged = state.git?.review_base_sha !== upstream;
-  const forceFreshReview = forced && state.review?.verdict === "pass";
+  const forceFreshReview = finalReview && state.review?.verdict === "pass";
   return {
     stale: upstreamChanged || state.git?.head_sha !== head || forceFreshReview,
     resetRounds: state.review?.verdict === "pass" && (upstreamChanged || forceFreshReview),
@@ -1864,7 +1868,7 @@ function prepareReviewBase(state) {
 
   requireCleanWorktree("rebase 后审核");
   const head = currentHead();
-  const { stale, resetRounds } = reviewInvalidation(state, upstream, head, forceReview);
+  const { stale, resetRounds } = reviewInvalidation(state, upstream, head, true);
   return saveState(state, {
     git: {
       ...state.git,
@@ -1971,7 +1975,7 @@ async function commandClose() {
       }
       state = commandFix();
     } else {
-      state = await commandReview();
+      state = await commandReview({ enforceRoundLimit: true });
     }
     head = currentHead();
   }
