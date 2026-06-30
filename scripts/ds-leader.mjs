@@ -40,6 +40,7 @@ const latestPaths = {
 
 const reviewModel = "gpt-5.5";
 const reviewEffort = "xhigh";
+const noChangeAdjudication = "DS_FIX_NO_CHANGES: all blocking findings rejected";
 
 const legacyLatestJson = path.join(dsRoot, "latest.json");
 const legacyLatestPrompt = path.join(dsRoot, "latest.prompt.md");
@@ -932,6 +933,10 @@ function driveIncomplete(summary) {
   return !summary || summary.active || summary.stop_reason !== "completed";
 }
 
+function rejectedAllFindings(summary) {
+  return String(summary?.latest_message || "").includes(noChangeAdjudication);
+}
+
 function resolveRepoPath(filePath) {
   if (!filePath) return null;
   return path.isAbsolute(filePath) ? filePath : path.join(root, filePath);
@@ -1233,7 +1238,9 @@ function commandRun() {
   requireCleanWorktree("ds-l run");
   const branch = currentBranch();
   if (!branch || branch === "main") fail("ds-l run 必须在任务 worktree 分支运行，不能直接在 main 上运行。");
-  const startSha = currentHead();
+  const currentSha = currentHead();
+  const startSha = state.git?.start_sha || currentSha;
+  const reviewBaseSha = state.git?.review_base_sha || startSha;
   const isBugfix = bugfix || state.delivery?.bugfix || false;
   const workerPrompt = `${loadLatestWorkerPrompt()}
 
@@ -1247,8 +1254,8 @@ function commandRun() {
     git: {
       ...state.git,
       start_sha: startSha,
-      review_base_sha: startSha,
-      head_sha: startSha,
+      review_base_sha: reviewBaseSha,
+      head_sha: currentSha,
       audited_upstream_sha: null,
     },
     review: {
@@ -1301,12 +1308,12 @@ function commandRun() {
 
   const latestState = readState();
   let gateError = null;
-  let headSha = startSha;
+  let headSha = currentSha;
   if (!result.error && (result.status ?? 1) === 0) {
     headSha = currentHead();
     const status = worktreeStatus();
     if (status) gateError = `Worker 结束后 worktree 不干净：\n${status}`;
-    else if (headSha === startSha) gateError = "Worker 没有创建任务提交。";
+    else if (headSha === currentSha) gateError = "Worker 没有创建任务提交。";
   }
   if (latestState) {
     const failed = Boolean(result.error) || (result.status ?? 1) !== 0 || Boolean(gateError) || incomplete;
@@ -1658,6 +1665,7 @@ function buildFixPrompt({
 10. 最终输出修复摘要，包括成立/误报判断、修改文件、验证结果、提交和剩余风险。
 11. Git range evidence 和当前文件内容是权威事实。
 12. Worker 历史日志仅供背景，不得覆盖代码事实。
+13. 如果全部 blocker/high/medium 都是误报且无需改动，最终输出必须单独包含精确行：${noChangeAdjudication}
 
 【用户原始需求】
 ${state.original_request || "(unknown)"}
@@ -1791,11 +1799,15 @@ function commandFix() {
   const latestState = readState();
   let gateError = null;
   let afterHead = beforeHead;
+  let noChangeRejected = false;
   if (!result.error && (result.status ?? 1) === 0) {
     afterHead = currentHead();
     const status = worktreeStatus();
     if (status) gateError = `Fix 结束后 worktree 不干净：\n${status}`;
-    else if (afterHead === beforeHead) gateError = "Fix 没有创建修复提交。";
+    else if (afterHead === beforeHead) {
+      noChangeRejected = rejectedAllFindings(summary);
+      if (!noChangeRejected) gateError = `Fix 没有创建修复提交，也未输出：${noChangeAdjudication}`;
+    }
   }
   if (latestState) {
     const failed = Boolean(result.error) || (result.status ?? 1) !== 0 || Boolean(gateError) || incomplete;
@@ -1818,8 +1830,9 @@ function commandFix() {
       },
       review: {
         ...latestState.review,
-        fix_iteration: currentFixIteration + 1,
+        fix_iteration: failed ? currentFixIteration : currentFixIteration + 1,
         audited_head_sha: null,
+        adjudication: noChangeRejected ? "all_blocking_findings_rejected" : null,
       },
       git: {
         ...latestState.git,
@@ -2278,6 +2291,8 @@ function runSelfTest() {
   assert.equal(driveIncomplete({ active: false, stop_reason: "completed" }), false);
   assert.equal(driveIncomplete({ active: false, stop_reason: "waiting_for_user" }), true);
   assert.equal(driveIncomplete(null), true);
+  assert.equal(rejectedAllFindings({ latest_message: noChangeAdjudication }), true);
+  assert.equal(rejectedAllFindings({ latest_message: "fixed" }), false);
   assert.deepEqual(summarizeChangeStats("a.js\0", "5\t5\ta.js"), {
     files: ["a.js"],
     added: 5,
