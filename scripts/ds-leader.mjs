@@ -933,6 +933,27 @@ function driveIncomplete(summary) {
   return !summary || summary.active || summary.stop_reason !== "completed";
 }
 
+function runDriveToCompletion(prompt) {
+  let args = ["drive", prompt];
+  let stdout = "";
+  let stderr = "";
+  let result;
+  let summary;
+  do {
+    result = spawnSync("cc-leader", args, {
+      cwd: root,
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024 * 20,
+      env: process.env,
+    });
+    stdout += result.stdout || "";
+    stderr += result.stderr || "";
+    summary = parseDriveSummary(result.stdout || "");
+    args = ["drive"];
+  } while (!result.error && (result.status ?? 1) === 0 && summary?.active);
+  return { result, stdout, stderr, summary };
+}
+
 function rejectedAllFindings(summary) {
   return String(summary?.latest_message || "").includes(noChangeAdjudication);
 }
@@ -1279,21 +1300,12 @@ function commandRun() {
   });
 
   console.log("\nStarting cc-leader drive with latest Codex worker prompt...\n");
-  const result = spawnSync("cc-leader", ["drive", workerPrompt], {
-    cwd: root,
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024 * 20,
-    env: process.env,
-  });
-
-  const stdout = result.stdout || "";
-  const stderr = result.stderr || "";
+  const { result, stdout, stderr, summary } = runDriveToCompletion(workerPrompt);
   writeText(latestPaths.driveStdout, stdout);
   writeText(latestPaths.driveStderr, stderr);
   if (stdout) process.stdout.write(stdout);
   if (stderr) process.stderr.write(stderr);
 
-  const summary = parseDriveSummary(stdout);
   const incomplete = driveIncomplete(summary);
   if (summary) {
     writeJson(latestPaths.driveSummary, summary);
@@ -1769,21 +1781,12 @@ function commandFix() {
   writeText(latestPaths.fixPrompt, fixPrompt);
 
   console.log("\nStarting manual-only ds-l fix with generated fix prompt...\n");
-  const result = spawnSync("cc-leader", ["drive", fixPrompt], {
-    cwd: root,
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024 * 20,
-    env: process.env,
-  });
-
-  const stdout = result.stdout || "";
-  const stderr = result.stderr || "";
+  const { result, stdout, stderr, summary } = runDriveToCompletion(fixPrompt);
   writeText(latestPaths.driveStdout, stdout);
   writeText(latestPaths.driveStderr, stderr);
   if (stdout) process.stdout.write(stdout);
   if (stderr) process.stderr.write(stderr);
 
-  const summary = parseDriveSummary(stdout);
   const incomplete = driveIncomplete(summary);
   if (summary) {
     writeJson(latestPaths.driveSummary, summary);
