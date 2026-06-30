@@ -254,6 +254,7 @@ function baseState(originalRequest, title) {
       findings: [],
       audited_head_sha: null,
       skipped: false,
+      explicitly_requested: false,
     },
     limits: {
       max_fix_iterations: 5,
@@ -1256,6 +1257,7 @@ function commandRun() {
       findings: [],
       audited_head_sha: null,
       skipped: false,
+      explicitly_requested: false,
     },
     delivery: {
       ...state.delivery,
@@ -1326,7 +1328,7 @@ function commandRun() {
       },
       delivery: {
         ...latestState.delivery,
-        status: failed ? "blocked" : "implemented",
+        status: failed ? "blocked" : summary?.active ? "implementing" : "implemented",
       },
       next_recommended_command: failed
         ? "ds-l -s"
@@ -1527,7 +1529,7 @@ function requireVerdict(value) {
   return verdict;
 }
 
-async function commandReview({ enforceRoundLimit = false } = {}) {
+async function commandReview({ explicit = true } = {}) {
   const state = readState();
   if (!state) fail('没有 latest state。请先运行: ds-l spec "需求"');
   requireCleanWorktree("ds-l review");
@@ -1537,12 +1539,6 @@ async function commandReview({ enforceRoundLimit = false } = {}) {
   const base = state.git?.review_base_sha || state.git?.start_sha;
   const evidence = commitRangeInputs(base, head);
   const round = (Number.isInteger(state.review?.round) ? state.review.round : 0) + 1;
-  const maxRounds = Number.isInteger(state.limits?.max_review_rounds)
-    ? state.limits.max_review_rounds
-    : 5;
-  if (enforceRoundLimit && round > maxRounds) {
-    fail(`审核已达到最多 ${maxRounds} 轮，请人工处理剩余问题。`);
-  }
 
   const parsed = runReviewAgent(
     `You are an independent code-review sub-agent. Review only code facts in the supplied git range.
@@ -1589,6 +1585,7 @@ ${formatCommitRangeEvidence(evidence)}`,
       model: reviewModel,
       effort: reviewEffort,
       skipped: false,
+      explicitly_requested: explicit || state.review?.explicitly_requested || false,
     },
     git: {
       ...state.git,
@@ -1860,7 +1857,7 @@ function prepareReviewBase(state) {
       phase: "blocked",
       status: "blocked",
       latest_error: "git rebase origin/main 失败；解决冲突并提交后重新运行 ds-l close。",
-      delivery: { ...state.delivery, status: "blocked" },
+      delivery: { ...state.delivery, status: "rebase_conflict" },
       next_recommended_command: "ds-l close",
     });
     fail(`git rebase origin/main failed\n${rebase.error?.message || rebase.stderr || rebase.stdout}`);
@@ -1949,10 +1946,19 @@ function finalizeClose(state) {
 async function commandClose() {
   let state = readState();
   if (!state) fail('没有 latest state。请先运行: ds-l spec "需求"');
+  const resumableRebase = state.delivery?.status === "rebase_conflict";
+  if (
+    state.phase === "running" ||
+    (state.phase === "blocked" && !resumableRebase) ||
+    ["implementing", "blocked", "not_started"].includes(state.delivery?.status)
+  ) {
+    fail("实现尚未成功完成，不能进入 ds-l close。");
+  }
   state = prepareReviewBase(state);
   let head = currentHead();
   const evidence = commitRangeInputs(state.git?.review_base_sha, head);
-  const explicitlyRequested = forceReview || /审核|review/i.test(state.original_request || "");
+  const explicitlyRequested =
+    forceReview || state.review?.explicitly_requested || /审核|review/i.test(state.original_request || "");
 
   if (
     state.review?.verdict !== "pass" &&
@@ -1969,13 +1975,13 @@ async function commandClose() {
     state.git?.audited_upstream_sha !== state.git?.review_base_sha
   ) {
     if (state.phase === "review" && state.review?.verdict === "needs_fix") {
-      const maxRounds = state.limits?.max_review_rounds || 5;
-      if ((state.review?.round || 0) >= maxRounds) {
-        fail(`审核已达到最多 ${maxRounds} 轮，仍有 blocker/high/medium，请人工处理。`);
+      const maxFixes = state.limits?.max_fix_iterations || 5;
+      if ((state.review?.fix_iteration || 0) >= maxFixes) {
+        fail(`修复复审已达到最多 ${maxFixes} 轮，仍有 blocker/high/medium，请人工处理。`);
       }
       state = commandFix();
     } else {
-      state = await commandReview({ enforceRoundLimit: true });
+      state = await commandReview({ explicit: false });
     }
     head = currentHead();
   }
@@ -2027,7 +2033,7 @@ function commandMerge() {
   const mainPath = mainWorktreePath();
   requireCleanWorktree("main worktree 合回", mainPath);
   runGitStep(["merge", "--ff-only", "origin/main"], "main 更新到 origin/main", mainPath);
-  runGitStep(["merge", "--ff-only", branch], `main ff-only merge ${branch}`, mainPath);
+  runGitStep(["merge", "--ff-only", head], `main ff-only merge audited HEAD ${head}`, mainPath);
   runGitStep(["push", "origin", "main"], "git push origin main", mainPath);
   saveState(state, {
     phase: "merged",
