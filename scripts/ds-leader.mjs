@@ -1448,10 +1448,6 @@ function runReviewAgent(prompt, round) {
   const result = spawnSync(
     "codex",
     [
-      "exec",
-      "--json",
-      "--ephemeral",
-      "--strict-config",
       "-m",
       reviewModel,
       "-c",
@@ -1460,6 +1456,10 @@ function runReviewAgent(prompt, round) {
       "read-only",
       "-a",
       "never",
+      "exec",
+      "--json",
+      "--ephemeral",
+      "--strict-config",
       "--output-schema",
       latestPaths.reviewSchema,
       "-o",
