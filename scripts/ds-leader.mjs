@@ -933,6 +933,14 @@ function driveIncomplete(summary) {
   return !summary || summary.active || summary.stop_reason !== "completed" || summary.last_exit_code !== 0;
 }
 
+function requestIsBugfix(request) {
+  return /\bbug\b|修复|修正|缺陷|故障|错误|异常|崩溃|回归/i.test(request || "");
+}
+
+function requestRequiresReview(request) {
+  return /审核|审查|审阅|复审|\breview\b|\baudit\b/i.test(request || "");
+}
+
 function runDriveToCompletion(prompt) {
   let args = ["drive", prompt];
   let stdout = "";
@@ -1262,7 +1270,7 @@ function commandRun() {
   const currentSha = currentHead();
   const startSha = state.git?.start_sha || currentSha;
   const reviewBaseSha = state.git?.review_base_sha || startSha;
-  const isBugfix = bugfix || state.delivery?.bugfix || false;
+  const isBugfix = bugfix || state.delivery?.bugfix || requestIsBugfix(state.original_request);
   const workerPrompt = `${loadLatestWorkerPrompt()}
 
 【Git 交付要求】
@@ -1961,7 +1969,7 @@ function markReviewSkipped(state, evidence) {
 }
 
 function finalizeClose(state) {
-  const isBugfix = bugfix || state.delivery?.bugfix || false;
+  const isBugfix = bugfix || state.delivery?.bugfix || requestIsBugfix(state.original_request);
   const status = isBugfix ? "awaiting_user_validation" : "ready_to_merge";
   const next = isBugfix ? "ds-l merge --verified" : "ds-l merge";
   const nextState = saveState(state, {
@@ -2000,7 +2008,7 @@ async function commandClose() {
   let head = currentHead();
   const evidence = commitRangeInputs(state.git?.review_base_sha, head);
   const explicitlyRequested =
-    forceReview || state.review?.explicitly_requested || /审核|review/i.test(state.original_request || "");
+    forceReview || state.review?.explicitly_requested || requestRequiresReview(state.original_request);
 
   if (
     state.review?.verdict !== "pass" &&
@@ -2300,6 +2308,10 @@ function runSelfTest() {
   assert.equal(driveIncomplete(null), true);
   assert.equal(rejectedAllFindings({ latest_message: noChangeAdjudication }), true);
   assert.equal(rejectedAllFindings({ latest_message: "fixed" }), false);
+  assert.equal(requestIsBugfix("修复登录错误"), true);
+  assert.equal(requestIsBugfix("新增登录页"), false);
+  assert.equal(requestRequiresReview("请审查这个改动"), true);
+  assert.equal(requestRequiresReview("新增登录页"), false);
   assert.deepEqual(summarizeChangeStats("a.js\0", "5\t5\ta.js"), {
     files: ["a.js"],
     added: 5,
