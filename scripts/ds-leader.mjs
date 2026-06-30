@@ -1833,6 +1833,15 @@ function runGitStep(args, label, cwd = root) {
   return result;
 }
 
+function reviewInvalidation(state, upstream, head, forced = false) {
+  const upstreamChanged = state.git?.review_base_sha !== upstream;
+  const forceFreshReview = forced && state.review?.verdict === "pass";
+  return {
+    stale: upstreamChanged || state.git?.head_sha !== head || forceFreshReview,
+    resetRounds: state.review?.verdict === "pass" && (upstreamChanged || forceFreshReview),
+  };
+}
+
 function prepareReviewBase(state) {
   requireCleanWorktree("ds-l close");
   const branch = currentBranch();
@@ -1855,7 +1864,7 @@ function prepareReviewBase(state) {
 
   requireCleanWorktree("rebase 后审核");
   const head = currentHead();
-  const stale = state.git?.review_base_sha !== upstream || state.git?.head_sha !== head;
+  const { stale, resetRounds } = reviewInvalidation(state, upstream, head, forceReview);
   return saveState(state, {
     git: {
       ...state.git,
@@ -1872,6 +1881,8 @@ function prepareReviewBase(state) {
           findings: [],
           audited_head_sha: null,
           skipped: false,
+          round: resetRounds ? 0 : state.review?.round || 0,
+          fix_iteration: resetRounds ? 0 : state.review?.fix_iteration || 0,
         }
       : state.review,
     delivery: {
@@ -1985,6 +1996,12 @@ function commandMerge() {
   requireCleanWorktree("ds-l merge");
   const branch = currentBranch();
   if (!branch || branch === "main") fail("ds-l merge 必须从任务 worktree 分支运行。");
+  if (
+    state.phase !== "closed" ||
+    !["ready_to_merge", "awaiting_user_validation"].includes(state.delivery?.status)
+  ) {
+    fail("当前任务尚未完成 ds-l close，不能合回 main。");
+  }
   const head = currentHead();
   if (state.review?.verdict !== "pass" || state.review?.audited_head_sha !== head) {
     fail("当前 HEAD 未通过最终审核，请先运行 ds-l close。");
@@ -2241,6 +2258,22 @@ function runSelfTest() {
       },
     ])[0].severity,
     "high",
+  );
+  const reviewed = {
+    git: { review_base_sha: "base", head_sha: "head" },
+    review: { verdict: "pass", round: 5 },
+  };
+  assert.deepEqual(reviewInvalidation(reviewed, "base", "head", true), {
+    stale: true,
+    resetRounds: true,
+  });
+  assert.deepEqual(reviewInvalidation(reviewed, "new-base", "new-head"), {
+    stale: true,
+    resetRounds: true,
+  });
+  assert.deepEqual(
+    reviewInvalidation({ ...reviewed, review: { verdict: "needs_fix", round: 5 } }, "base", "head", true),
+    { stale: false, resetRounds: false },
   );
   console.log("ds-l self-test: pass");
 }
