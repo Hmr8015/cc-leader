@@ -396,7 +396,7 @@ function currentBranch(cwd = root) {
 }
 
 function worktreeStatus(cwd = root) {
-  return gitText(["status", "--porcelain"], "读取 worktree 状态", cwd);
+  return gitText(["status", "--porcelain", "--untracked-files=all"], "读取 worktree 状态", cwd);
 }
 
 function requireCleanWorktree(stage, cwd = root) {
@@ -1305,7 +1305,7 @@ function commandRun() {
       findings: [],
       audited_head_sha: null,
       skipped: false,
-      explicitly_requested: false,
+      explicitly_requested: state.review?.explicitly_requested || false,
     },
     delivery: {
       ...state.delivery,
@@ -2065,7 +2065,7 @@ function commandMerge() {
   const branch = currentBranch();
   if (!branch || branch === "main") fail("ds-l merge 必须从任务 worktree 分支运行。");
   if (
-    state.phase !== "closed" ||
+    !["closed", "report"].includes(state.phase) ||
     !["ready_to_merge", "awaiting_user_validation"].includes(state.delivery?.status)
   ) {
     fail("当前任务尚未完成 ds-l close，不能合回 main。");
