@@ -1896,7 +1896,10 @@ function prepareReviewBase(state) {
 
   runGitStep(["fetch", "origin"], "git fetch origin");
   const upstream = gitText(["rev-parse", "origin/main"], "读取 origin/main");
-  const rebase = runGit(["rebase", "origin/main"]);
+  const previousBase = state.git?.review_base_sha || state.git?.start_sha;
+  if (!previousBase) fail("缺少任务 git base，无法安全 rebase。");
+  requireCommitRange(previousBase, currentHead());
+  const rebase = runGit(["rebase", "--onto", "origin/main", previousBase]);
   if (rebase.error || (rebase.status ?? 1) !== 0) {
     saveState(state, {
       phase: "blocked",

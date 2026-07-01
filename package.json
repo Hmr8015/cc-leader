@@ -10,7 +10,8 @@
     "validate": "node scripts/validate-skill-pack.mjs"
   },
   "bin": {
-    "cc-leader": "./scripts/cc-leader-harness.mjs"
+    "cc-leader": "./scripts/cc-leader-harness.mjs",
+    "ds-l": "./scripts/ds-leader.mjs"
   },
   "exports": {
     "./manifest": "./cc-leader.manifest.json"
