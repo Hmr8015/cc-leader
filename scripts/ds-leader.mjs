@@ -120,7 +120,7 @@ Phase 1 workflow 命令：
     读取 latest 产物、review、Codex Worker 输出、git status/diff/cached diff/untracked text files，调 DeepSeek 生成最终报告。
 
   ds-l merge [--verified]
-    将已通过最终审核的任务分支 ff-only 合回 main 并 push；bugfix 必须传 --verified。
+    用户确认验证后，将已通过最终审核的任务分支 ff-only 合回 main 并 push。
 
 兼容快捷方式：
 
@@ -350,7 +350,7 @@ function suggestNext(state) {
   }
   if (state.phase === "fix") return "ds-l close";
   if (state.phase === "closed") {
-    return state.delivery?.bugfix ? "ds-l merge --verified" : "ds-l merge";
+    return "ds-l merge --verified";
   }
   if (state.phase === "report") return state.next_recommended_command || "ds-l -s";
   return "ds-l -s";
@@ -1975,8 +1975,8 @@ function markReviewSkipped(state, evidence) {
 
 function finalizeClose(state) {
   const isBugfix = bugfix || state.delivery?.bugfix || requestIsBugfix(state.original_request);
-  const status = isBugfix ? "awaiting_user_validation" : "ready_to_merge";
-  const next = isBugfix ? "ds-l merge --verified" : "ds-l merge";
+  const status = "awaiting_user_validation";
+  const next = "ds-l merge --verified";
   const nextState = saveState(state, {
     phase: "closed",
     status: "active",
@@ -2071,9 +2071,7 @@ function commandMerge() {
   if (state.review?.verdict !== "pass" || state.review?.audited_head_sha !== head) {
     fail("当前 HEAD 未通过最终审核，请先运行 ds-l close。");
   }
-  if (state.delivery?.bugfix && !verified) {
-    fail("bugfix 必须由用户确认验证通过后运行: ds-l merge --verified");
-  }
+  if (!verified) fail("必须由用户确认验证通过后运行: ds-l merge --verified");
 
   runGitStep(["fetch", "origin"], "git fetch origin");
   const upstream = gitText(["rev-parse", "origin/main"], "读取 origin/main");
