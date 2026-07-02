@@ -7,6 +7,7 @@ SKILLS_SOURCE_DIR="${REPO_ROOT}/skills"
 CLAUDE_SKILLS_DIR="${HOME}/.claude/skills"
 LOCAL_BIN_DIR="${HOME}/.local/bin"
 WRAPPER_PATH="${LOCAL_BIN_DIR}/cc-leader"
+DS_WRAPPER_PATH="${LOCAL_BIN_DIR}/ds-l"
 
 log() {
   printf '%s\n' "$1"
@@ -64,28 +65,30 @@ remove_stale_skill_targets() {
 }
 
 ensure_wrapper() {
+  local wrapper_path="$1"
+  local target_script="$2"
   local expected
 
   expected=$(cat <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-exec node "${REPO_ROOT}/scripts/cc-leader-harness.mjs" "\$@"
+exec node "${REPO_ROOT}/scripts/${target_script}" "\$@"
 EOF
 )
 
-  if [[ -f "$WRAPPER_PATH" ]] && [[ "$(cat "$WRAPPER_PATH")" == "$expected" ]]; then
-    chmod +x "$WRAPPER_PATH"
-    log "wrapper 已存在, 跳过: ${WRAPPER_PATH}"
+  if [[ -f "$wrapper_path" ]] && [[ "$(cat "$wrapper_path")" == "$expected" ]]; then
+    chmod +x "$wrapper_path"
+    log "wrapper 已存在, 跳过: ${wrapper_path}"
     return
   fi
 
-  if [[ -e "$WRAPPER_PATH" || -L "$WRAPPER_PATH" ]]; then
-    rm -rf "$WRAPPER_PATH"
+  if [[ -e "$wrapper_path" || -L "$wrapper_path" ]]; then
+    rm -rf "$wrapper_path"
   fi
 
-  printf '%s\n' "$expected" >"$WRAPPER_PATH"
-  chmod +x "$WRAPPER_PATH"
-  log "wrapper 已写入: ${WRAPPER_PATH}"
+  printf '%s\n' "$expected" >"$wrapper_path"
+  chmod +x "$wrapper_path"
+  log "wrapper 已写入: ${wrapper_path}"
 }
 
 check_path_warning() {
@@ -94,7 +97,7 @@ check_path_warning() {
       return
       ;;
     *)
-      warn "${LOCAL_BIN_DIR} 不在 PATH 中。请手动加入后再直接使用 cc-leader。"
+      warn "${LOCAL_BIN_DIR} 不在 PATH 中。请手动加入后再直接使用 cc-leader / ds-l。"
       ;;
   esac
 }
@@ -146,7 +149,8 @@ main() {
     exit 1
   fi
 
-  ensure_wrapper
+  ensure_wrapper "$WRAPPER_PATH" "cc-leader-harness.mjs"
+  ensure_wrapper "$DS_WRAPPER_PATH" "ds-leader.mjs"
   check_path_warning
 
   log "开始校验仓库完整性: npm run validate"
@@ -159,6 +163,7 @@ main() {
 安装完成
 - 已同步 skill: ${skill_count} 个
 - wrapper 路径: ${WRAPPER_PATH}
+- ds-l wrapper 路径: ${DS_WRAPPER_PATH}
 - 使用方式:
   cd <目标项目根目录>
   cc-leader init --slug <project-slug>

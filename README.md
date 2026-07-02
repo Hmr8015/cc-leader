@@ -2,10 +2,11 @@
 
 给 Claude Code 用的多 agent workflow skill pack。
 
-它做两件事：
+它做三件事：
 
 1. 用 `cc` + `codex` 跑一套有 gate 的开发 workflow：spec -> plan -> task -> execute -> review -> report
 2. 提供一个独立的 detached codex `drive` 模式：用户给任务，codex 静默持续做，只在少数里程碑事件上通知
+3. 提供独立的 `ds-l` 闭环：DeepSeek 做 leader，Codex 做 worker，实现 -> 审核 -> 修复 -> 复审 -> 合回 main（见下文 "DS Leader (`ds-l`) 模式"）
 
 ## 这是什么
 
@@ -28,6 +29,7 @@
 | `/cc-leader-spec`  | 起草或续接 spec                    | 还没批准 spec，或要重写 spec           |
 | `/cc-leader-run`   | 按 workflow gate 自动推进          | 需要完整 spec / review / report 链     |
 | `/cc-leader-drive` | 启动 detached codex 做用户指定任务 | 不想走 workflow，只想让 codex 持续做事 |
+| `ds-l`             | DeepSeek leader + Codex worker 闭环 | 单任务的实现、审核、修复、复审、合回交付 |
 
 CLI 对应入口：
 
@@ -64,6 +66,7 @@ cd cc-leader
 - 旧 symlink 会先清掉，再替换成真实目录
 - 删除仓库里已不存在的过期 skill 目录
 - 在 `~/.local/bin/cc-leader` 写 wrapper
+- 在 `~/.local/bin/ds-l` 写 wrapper
 - 运行 `npm run validate`
 
 要求：
@@ -71,6 +74,7 @@ cd cc-leader
 - `~/.local/bin` 在 `PATH` 里
 - 本机能运行 `node`
 - 本机已安装 `codex`
+- 使用 `ds-l` 时还需导出 `DEEPSEEK_API_KEY`
 
 卸载：
 
@@ -402,6 +406,54 @@ cc-leader drive \
 | 用户通知           | 每次 `run` 停点           | 只有 4 类里程碑               |
 | 推荐用途           | 正式开发流程              | 独立长任务、少打断执行        |
 
+## DS Leader (`ds-l`) 模式
+
+`ds-l` 是独立于上述 workflow 的第三个入口：DeepSeek 做 leader（生成 spec / plan / task / report 文档），Codex 做 worker（实现与修复），`gpt-5.5` 做独立审核。适合单任务的"实现 -> 审核 -> 修复 -> 复审 -> 合回"闭环交付。
+
+### 前置要求
+
+- 已导出 `DEEPSEEK_API_KEY`（模型默认 `deepseek-v4-pro`，可用 `DEEPSEEK_MODEL` 覆盖）
+- `cc-leader` wrapper 已安装（`ds-l run` / `ds-l fix` 内部调用 `cc-leader drive`）
+- 本机已安装 `codex`（审核子代理固定使用 `gpt-5.5` / `xhigh`）
+- `run` / `fix` / `close` / `merge` 必须在独立任务 worktree 分支运行，禁止直接在 main 上运行
+
+### 命令面
+
+| 命令                                  | 用途                                                                                        |
+| ------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `ds-l spec "需求"`                    | DeepSeek 生成 `spec.md` + `acceptance.md`                                                   |
+| `ds-l plan`                           | 基于 spec 生成 `plan.md`                                                                    |
+| `ds-l task`                           | 生成 `task.md` + `worker.prompt.md`                                                         |
+| `ds-l run [--bugfix]`                 | 记录 git base，`cc-leader drive` 驱动 Codex 实现、最小验证并提交；结束时 worktree 必须干净  |
+| `ds-l close [--force-review] [--bugfix]` | fetch 后 `rebase --onto origin/main <base>` 仅重放任务提交，然后自动审核/修复/复审直到通过 |
+| `ds-l review`                         | 显式独立审核 `review_base..HEAD`；显式调用不适用小改动跳过规则                              |
+| `ds-l fix`                            | 仅 verdict 为 `needs_fix` 时，裁决 findings，修复成立的 blocker/high/medium，验证并提交     |
+| `ds-l report`                         | 汇总 latest 产物、review、worker 输出与当前工作区事实，DeepSeek 生成最终报告                |
+| `ds-l merge --verified`               | 用户确认验证后，把已通过最终审核的 HEAD ff-only 合回 main 并 push                           |
+
+兼容快捷方式：`ds-l -p "需求"`（spec + plan + task 预览，不 run）、`ds-l -u`（用 latest worker prompt 执行）、`ds-l -s`（查看状态与下一步建议）。
+
+### 闭环规则
+
+- 实现、最小验证、提交完成后才能进入审核；`run` 结束时必须有任务提交且 worktree 干净
+- 审核范围固定为记录的 git base..HEAD；base 必须是 HEAD 的祖先
+- 审核固定 `gpt-5.5` / `xhigh`，read-only 独立子代理，只基于 git range 事实输出 JSON findings
+- 小改动跳过规则（单文件、非二进制、改动 ≤ 10 行）只在非显式审核且第 0 轮时生效；显式审核（`ds-l review`、`--force-review`、需求文本本身要求审核）不可跳过
+- 成立的 blocker / high / medium 必须修复、验证、提交并复审；low 不阻塞；全部误报时 worker 必须输出固定裁决行才允许零改动通过
+- 修复与复审最多 5 轮，超过后停下来交人工处理
+- `close` 每轮都先 fetch，用 `rebase --onto` 仅重放任务提交；origin/main 变化会使旧审核失效并强制复审
+- 最终审核通过后进入 `awaiting_user_validation`，由用户验证后运行 `ds-l merge --verified`
+- main 只允许 ff-only 合回并 push；merge 前若 origin/main 又发生变化，回到 `ds-l close` 复审
+
+### 状态与产物
+
+全部在 `.cc-leader/ds-leader/latest/` 下：
+
+- `spec.md`、`plan.md`、`task.md`、`acceptance.md`、`worker.prompt.md`
+- `review.md`、`report.md`、`fix.prompt.md`
+- `state.json`（由 `ds-l` 自管，不要手改）
+- `codex/`（drive summary 与各轮 review 输出）、`logs/`（DeepSeek 各阶段响应）、`debug/`（原始响应排查）
+
 ## 外部依赖风险策略
 
 第三方 API / 外部服务 / 网络依赖问题单独归入 `external_dependency_risks`：
@@ -440,6 +492,7 @@ cc-leader drive \
 | bootstrap skill    | [skills/using-cc-leader/SKILL.md](skills/using-cc-leader/SKILL.md)                                                                         |
 | 用户入口 skill     | [skills/spec/SKILL.md](skills/spec/SKILL.md) · [skills/run/SKILL.md](skills/run/SKILL.md) · [skills/drive/SKILL.md](skills/drive/SKILL.md) |
 | harness            | [scripts/cc-leader-harness.mjs](scripts/cc-leader-harness.mjs)                                                                             |
+| ds-l 调度器        | [scripts/ds-leader.mjs](scripts/ds-leader.mjs)                                                                                             |
 | 安装脚本           | [scripts/install.sh](scripts/install.sh)                                                                                                   |
 | 卸载脚本           | [scripts/uninstall.sh](scripts/uninstall.sh)                                                                                               |
 | 校验脚本           | [scripts/validate-skill-pack.mjs](scripts/validate-skill-pack.mjs)                                                                         |
@@ -479,6 +532,7 @@ npm run smoke
 - `job:status`
 - detached codex `drive`
 - drive 里程碑监控与自动 continue
+- `ds-l`：DeepSeek leader 的实现、审核、修复、复审、合回闭环
 - 安装、卸载、校验、自带最小 smoke
 
 未实现：
