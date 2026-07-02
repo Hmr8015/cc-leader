@@ -301,7 +301,8 @@ function createDriveId(title = "drive") {
 function parsePhaseIdsFromPlan(planPath) {
   if (!planPath || !fileExists(planPath)) return [];
   const text = readFileSync(abs(planPath), "utf8");
-  const matches = [...text.matchAll(/phase-[0-9]{1,2}-[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?/g)];
+  // 排除后接文件扩展名的匹配（如 phase-01-foo-result.md），避免 artifact 文件名被当成 phase id
+  const matches = [...text.matchAll(/phase-[0-9]{1,2}-[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?![a-zA-Z0-9-]|\.[a-zA-Z0-9])/g)];
   const raw = [...new Set(matches.map((m) => m[0]))];
   const validPattern = new RegExp(manifest.naming.phaseIdPattern);
   const invalid = raw.filter((id) => !validPattern.test(id));
